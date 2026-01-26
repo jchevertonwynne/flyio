@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::Send;
@@ -62,7 +63,7 @@ pub struct Init {
     #[serde(rename = "node_id")]
     pub node_id: String,
     #[serde(rename = "node_ids")]
-    pub node_ids: Vec<String>,
+    pub node_ids: HashSet<String>,
 }
 
 pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
