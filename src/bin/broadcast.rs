@@ -26,7 +26,8 @@ struct BroadcastNode {
 struct BroadcastNodeInner {
     node_id: String,
     msg_id: AtomicU64,
-    seen: Mutex<HashMap<u64, HashSet<String>>>,
+    seen_complete: Mutex<HashSet<u64>>,
+    seen: Mutex<HashMap<u64, String>>,
     neighbours: Mutex<HashSet<String>>,
     tasks: TaskTracker,
     cancel: CancellationToken,
@@ -48,10 +49,9 @@ enum BroadcastNodePayload {
     BroadcastOk(BroadcastOk),
     Read(Read),
     ReadOk(ReadOk),
-    ReadMin(ReadMin),
-    ReadMinOk(ReadMinOk),
     Topology(Topology),
     TopologyOk(TopologyOk),
+    SendMin(SendMin),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,20 +63,24 @@ struct Broadcast {
 impl HandleMessage for Broadcast {
     async fn handle(
         self,
+        msg: Message<()>,
         node: &BroadcastNode,
-        src: String,
-        dst: String,
-        incoming_msg_id: Option<u64>,
         tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
-        let Broadcast { message } = self;
+        let Self { message } = self;
+        let Message {
+            src,
+            dst,
+            body:
+                Body {
+                    incoming_msg_id,
+                    in_reply_to: _,
+                    payload: _,
+                },
+        } = msg;
+
         let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-        node.seen
-            .lock()
-            .await
-            .entry(message)
-            .or_default()
-            .insert(src.clone());
+        node.seen.lock().await.entry(message).or_insert(src.clone());
 
         let response = Message {
             src: dst,
@@ -101,31 +105,41 @@ struct BroadcastOk;
 impl HandleMessage for BroadcastOk {
     async fn handle(
         self,
-        _node: &BroadcastNode,
-        _src: String,
-        _dst: String,
-        _incoming_msg_id: Option<u64>,
+        _msg: Message<()>,
+        _txde: &BroadcastNode,
         _tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
-        todo!()
+        bail!("expected broadcast_ok message recevied")
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct Read;
+
 impl HandleMessage for Read {
     async fn handle(
         self,
+        msg: Message<()>,
         node: &BroadcastNode,
-        src: String,
-        dst: String,
-        incoming_msg_id: Option<u64>,
         tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
+        let Self {} = self;
+        let Message {
+            src,
+            dst,
+            body:
+                Body {
+                    incoming_msg_id,
+                    in_reply_to: _,
+                    payload: _,
+                },
+        } = msg;
+
         let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
         let seen = node.seen.lock().await;
-        let messages = seen.keys().copied().collect();
+        let mut messages: HashSet<u64> = seen.keys().copied().collect();
+        messages.extend(node.seen_complete.lock().await.iter().cloned());
 
         let response = Message {
             src: dst,
@@ -148,96 +162,15 @@ impl HandleMessage for Read {
 struct ReadOk {
     messages: HashSet<u64>,
 }
+
 impl HandleMessage for ReadOk {
     async fn handle(
         self,
-        node: &BroadcastNode,
-        src: String,
-        _dst: String,
-        _incoming_msg_id: Option<u64>,
+        _msg: Message<()>,
+        _node: &BroadcastNode,
         _tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
-        let ReadOk { messages } = self;
-        let mut messages_locked = node.seen.lock().await;
-        for msg in messages {
-            messages_locked.entry(msg).or_default().insert(src.clone());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct ReadMin;
-impl HandleMessage for ReadMin {
-    async fn handle(
-        self,
-        node: &BroadcastNode,
-        src: String,
-        dst: String,
-        incoming_msg_id: Option<u64>,
-        tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()> {
-        let Self {} = self;
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-        let mut seen = node.seen.lock().await;
-        let messages: HashSet<u64> = seen
-            .iter()
-            .filter_map(|(k, v)| {
-                if v.contains(&src) {
-                    return None;
-                }
-                Some(*k)
-            })
-            .collect();
-
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        for msg in &messages {
-            if let Some(s) = seen.get_mut(msg) {
-                s.insert(src.clone());
-            }
-        }
-
-        let response = Message {
-            src: dst,
-            dst: src,
-            body: Body {
-                incoming_msg_id: Some(resp_msg_id),
-                in_reply_to: incoming_msg_id,
-                payload: BroadcastNodePayload::ReadMinOk(ReadMinOk { messages }),
-            },
-        };
-
-        tx.send(response).await.context("channel closed")?;
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct ReadMinOk {
-    messages: HashSet<u64>,
-}
-impl HandleMessage for ReadMinOk {
-    async fn handle(
-        self,
-        node: &BroadcastNode,
-        src: String,
-        _dst: String,
-        _incoming_msg_id: Option<u64>,
-        _tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()> {
-        let Self { messages } = self;
-        let mut messages_locked = node.seen.lock().await;
-        for msg in messages {
-            messages_locked.entry(msg).or_default().insert(src.clone());
-        }
-
-        Ok(())
+        bail!("should never receive a read_ok message")
     }
 }
 
@@ -246,16 +179,26 @@ impl HandleMessage for ReadMinOk {
 struct Topology {
     topology: HashMap<String, HashSet<String>>,
 }
+
 impl HandleMessage for Topology {
     async fn handle(
         self,
+        msg: Message<()>,
         node: &BroadcastNode,
-        src: String,
-        dst: String,
-        incoming_msg_id: Option<u64>,
         tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
         let Self { mut topology } = self;
+        let Message {
+            src,
+            dst,
+            body:
+                Body {
+                    incoming_msg_id,
+                    in_reply_to: _,
+                    payload: _,
+                },
+        } = msg;
+
         let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
         let Some(neighbours) = topology.remove(&node.node_id) else {
             bail!("malformed topology msg");
@@ -288,13 +231,49 @@ struct TopologyOk;
 impl HandleMessage for TopologyOk {
     async fn handle(
         self,
+        _msg: Message<()>,
         _node: &BroadcastNode,
-        _src: String,
-        _dst: String,
-        _incoming_msg_id: Option<u64>,
         _tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()> {
         bail!("unexpcted topology ok msg")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct SendMin {
+    messages: HashSet<u64>,
+}
+
+impl HandleMessage for SendMin {
+    async fn handle(
+        self,
+        msg: Message<()>,
+        node: &BroadcastNode,
+        _tx: Sender<Message<BroadcastNodePayload>>,
+    ) -> anyhow::Result<()> {
+        let Self { messages } = self;
+        let Message {
+            src,
+            dst: _,
+            body:
+                Body {
+                    incoming_msg_id: _,
+                    in_reply_to: _,
+                    payload: _,
+                },
+        } = msg;
+
+        let seen_complete = node.seen_complete.lock().await;
+        let mut seen_locked = node.seen.lock().await;
+        for msg in messages {
+            if seen_complete.contains(&msg) {
+                continue;
+            }
+            seen_locked.entry(msg).or_insert(src.clone());
+        }
+
+        Ok(())
     }
 }
 
@@ -307,10 +286,8 @@ enum SuppliedPayload {
 trait HandleMessage {
     async fn handle(
         self,
+        msg: Message<()>,
         node: &BroadcastNode,
-        src: String,
-        dst: String,
-        incoming_msg_id: Option<u64>,
         tx: Sender<Message<BroadcastNodePayload>>,
     ) -> anyhow::Result<()>;
 }
@@ -352,6 +329,7 @@ impl Node for BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {
                 node_id,
                 msg_id: AtomicU64::new(1),
+                seen_complete: Mutex::new(HashSet::new()),
                 seen: Mutex::new(HashMap::new()),
                 neighbours: Mutex::new(HashSet::new()),
                 tasks: tracker,
@@ -371,12 +349,22 @@ impl Node for BroadcastNode {
             body:
                 Body {
                     incoming_msg_id,
-                    in_reply_to: _,
+                    in_reply_to,
                     payload,
                 },
         } = msg;
 
-        payload.handle(self, src, dst, incoming_msg_id, tx).await?;
+        let msg = Message {
+            src,
+            dst,
+            body: Body {
+                incoming_msg_id,
+                in_reply_to,
+                payload: (),
+            },
+        };
+
+        payload.handle(msg, self, tx).await?;
 
         Ok(())
     }
@@ -387,18 +375,38 @@ impl Node for BroadcastNode {
         tx: Sender<Message<Self::Payload>>,
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Gossip = msg;
-        for neighbour in self.neighbours.lock().await.iter() {
+
+        let mut complete_locked = self.seen_complete.lock().await;
+        let neighbours_locked = self.neighbours.lock().await;
+        let mut msgs_locked = self.seen.lock().await;
+
+        let mut need_to_send: HashMap<String, HashSet<u64>> = HashMap::new();
+
+        for (msg, seen) in msgs_locked.drain() {
+            let mut unseen_by = neighbours_locked.clone();
+            unseen_by.remove(&seen);
+            for unseen_neighbour in unseen_by {
+                need_to_send
+                    .entry(unseen_neighbour)
+                    .or_default()
+                    .insert(msg);
+            }
+            complete_locked.insert(msg);
+        }
+
+        for (unseen_neighbour, messages) in need_to_send {
+            let msg_id = self.msg_id.fetch_add(1, Ordering::SeqCst);
             tx.send(Message {
                 src: self.node_id.clone(),
-                dst: neighbour.clone(),
+                dst: unseen_neighbour,
                 body: Body {
-                    incoming_msg_id: None,
+                    incoming_msg_id: Some(msg_id),
                     in_reply_to: None,
-                    payload: BroadcastNodePayload::ReadMin(ReadMin),
+                    payload: BroadcastNodePayload::SendMin(SendMin { messages }),
                 },
             })
             .await
-            .context("channel was closed")?;
+            .context("failed to send supplied msg")?;
         }
 
         Ok(())
