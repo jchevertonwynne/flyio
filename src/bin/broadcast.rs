@@ -102,16 +102,7 @@ impl HandleMessage for Broadcast {
 #[serde(rename_all = "snake_case")]
 struct BroadcastOk;
 
-impl HandleMessage for BroadcastOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        _txde: &BroadcastNode,
-        _tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()> {
-        bail!("expected broadcast_ok message recevied")
-    }
-}
+impl HandleMessage for BroadcastOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,16 +154,7 @@ struct ReadOk {
     messages: HashSet<u64>,
 }
 
-impl HandleMessage for ReadOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        _node: &BroadcastNode,
-        _tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()> {
-        bail!("should never receive a read_ok message")
-    }
-}
+impl HandleMessage for ReadOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,16 +210,7 @@ impl HandleMessage for Topology {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TopologyOk;
-impl HandleMessage for TopologyOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        _node: &BroadcastNode,
-        _tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()> {
-        bail!("unexpcted topology ok msg")
-    }
-}
+impl HandleMessage for TopologyOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -283,13 +256,18 @@ enum SuppliedPayload {
 }
 
 #[enum_dispatch]
-trait HandleMessage {
+trait HandleMessage: Sized {
     async fn handle(
         self,
         msg: Message<()>,
         node: &BroadcastNode,
         tx: Sender<Message<BroadcastNodePayload>>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<()> {
+        _ = msg;
+        _ = node;
+        _ = tx;
+        bail!("unexpected msg type")
+    }
 }
 
 impl Node for BroadcastNode {

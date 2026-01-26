@@ -41,6 +41,33 @@ pub struct Message<Payload> {
     pub body: Body<Payload>,
 }
 
+impl<T> Message<T> {
+    pub fn extract_payload(self) -> (T, Message<()>) {
+        let Message {
+            src,
+            dst,
+            body:
+                Body {
+                    incoming_msg_id,
+                    in_reply_to,
+                    payload,
+                },
+        } = self;
+
+        let msg = Message {
+            src,
+            dst,
+            body: Body {
+                incoming_msg_id,
+                in_reply_to,
+                payload: (),
+            },
+        };
+
+        (payload, msg)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Body<Payload> {
     #[serde(rename = "msg_id")]

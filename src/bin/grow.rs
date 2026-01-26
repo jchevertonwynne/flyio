@@ -115,16 +115,7 @@ impl HandleMessage for Add {
 #[serde(rename_all = "snake_case")]
 struct AddOk;
 
-impl HandleMessage for AddOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        _txde: &GrowNode,
-        _tx: Sender<Message<GrowNodePayload>>,
-    ) -> anyhow::Result<()> {
-        bail!("expected broadcast_ok message recevied")
-    }
-}
+impl HandleMessage for AddOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,16 +164,7 @@ struct ReadOk {
     value: u64,
 }
 
-impl HandleMessage for ReadOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        _node: &GrowNode,
-        _tx: Sender<Message<GrowNodePayload>>,
-    ) -> anyhow::Result<()> {
-        bail!("should never receive a read_ok message")
-    }
-}
+impl HandleMessage for ReadOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -365,13 +347,18 @@ enum SuppliedPayload {
 }
 
 #[enum_dispatch]
-trait HandleMessage {
+trait HandleMessage: Sized {
     async fn handle(
         self,
         msg: Message<()>,
         node: &GrowNode,
         tx: Sender<Message<GrowNodePayload>>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<()> {
+        _ = msg;
+        _ = node;
+        _ = tx;
+        bail!("unexpected msg type")
+    }
 }
 
 impl Node for GrowNode {
@@ -429,27 +416,7 @@ impl Node for GrowNode {
         msg: Message<Self::Payload>,
         tx: Sender<Message<Self::Payload>>,
     ) -> anyhow::Result<()> {
-        let Message {
-            src,
-            dst,
-            body:
-                Body {
-                    incoming_msg_id,
-                    in_reply_to,
-                    payload,
-                },
-        } = msg;
-
-        let msg = Message {
-            src,
-            dst,
-            body: Body {
-                incoming_msg_id,
-                in_reply_to,
-                payload: (),
-            },
-        };
-
+        let (payload, msg) = msg.extract_payload();
         payload.handle(msg, self, tx).await?;
 
         Ok(())
