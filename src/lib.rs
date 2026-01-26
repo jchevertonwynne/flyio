@@ -1,16 +1,15 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::Send;
-use std::pin::pin;
 
 use anyhow::{Context, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::BufReader;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use std::io::BufRead;
+use tokio::io::AsyncWriteExt;
 use tokio::select;
-use tokio::signal::ctrl_c;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinSet;
 
 pub trait Node: Clone + Sized + Send + 'static {
@@ -67,12 +66,24 @@ pub struct Init {
 }
 
 pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let buf_reader = BufReader::new(stdin);
-    let mut lines = buf_reader.lines();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
 
-    let (node, mut rx_node) = handle_init::<N>(&mut stdout, &mut lines).await?;
+    let mut stdin = spawn_stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let (node, mut rx_node) = select! {
+        _ = sigint.recv() => {
+            return Ok(())
+        }
+        _ = sigterm.recv() => {
+            return Ok(())
+        }
+        res = handle_init::<N>(&mut stdout, &mut stdin) => {
+            let (node, rx_node) = res?;
+            (node, rx_node)
+        }
+    };
 
     let (tx, mut rx) = channel::<Message<N::Payload>>(1);
 
@@ -90,16 +101,17 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     let mut set = JoinSet::new();
 
-    let mut ctrl_c = pin!(ctrl_c());
-
     loop {
         select! {
-            _ = &mut ctrl_c => {
+            _ = sigint.recv() => {
                 break
             }
-            line = lines.next_line() => {
-                let line = line.context("failed to read line")?;
+            _ = sigterm.recv() => {
+                break
+            }
+            line = stdin.recv() => {
                 let Some(line) = line else { break };
+                let line = line.context("failed to read line")?;
 
                 let msg: Message<N::Payload> =
                     serde_json::from_str(&line).context("failed to deserialize msg")?;
@@ -145,10 +157,10 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
 async fn handle_init<N: Node>(
     stdout: &mut tokio::io::Stdout,
-    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
-) -> Result<(N, tokio::sync::mpsc::Receiver<N::PayloadSupplied>), anyhow::Error> {
-    let line = lines
-        .next_line()
+    stdin: &mut Receiver<anyhow::Result<String>>,
+) -> Result<(N, Receiver<N::PayloadSupplied>), anyhow::Error> {
+    let line = stdin
+        .recv()
         .await
         .context("failed to read from stdin")?
         .context("no line was present for init msg")?;
@@ -187,4 +199,22 @@ async fn handle_init<N: Node>(
         .context("failed to write to stdout")?;
 
     Ok((node, rx_supplied))
+}
+
+fn spawn_stdin() -> Receiver<anyhow::Result<String>> {
+    let (tx, rx) = channel(1);
+
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            if tx
+                .blocking_send(line.context("failed to read line"))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    rx
 }

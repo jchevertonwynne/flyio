@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     ops::Deref,
     sync::{
         Arc,
@@ -38,7 +39,7 @@ enum GeneratePayload {
 
 impl Node for GenerateNode {
     type Payload = GeneratePayload;
-    type PayloadSupplied = ();
+    type PayloadSupplied = Infallible;
 
     fn from_init(init: Init, _rx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
         let Init {

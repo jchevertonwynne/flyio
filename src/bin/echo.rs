@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     ops::Deref,
     sync::{
         Arc,
@@ -37,7 +38,7 @@ enum EchoPayload {
 
 impl Node for EchoNode {
     type Payload = EchoPayload;
-    type PayloadSupplied = ();
+    type PayloadSupplied = Infallible;
 
     fn from_init(_init: Init, _tx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
         Ok(EchoNode {
