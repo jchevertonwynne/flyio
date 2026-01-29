@@ -10,6 +10,7 @@ use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
 
 use crate::kv::{KvClient, KvPayload, MsgIDProvider};
 use crate::message::{Body, Init, Message, MinBody, PayloadInit};
@@ -74,17 +75,17 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    eprintln!("sending msg {msg:?}");
+                    debug!("sending msg {msg:?}");
                     match serde_json::to_string(&msg) {
                         Ok(mut outbound) => {
                             outbound.push('\n');
 
                             if let Err(err) = stdout.write_all(outbound.as_bytes()).await {
-                                eprintln!("failed to write node msg to stdout: {err}");
+                                error!("failed to write node msg to stdout: {err}");
                             }
                         }
                         Err(err) => {
-                            eprintln!(
+                            error!(
                                 "failed to serialize outbound node msg {msg:?} before writing: {err}"
                             );
                         }
@@ -98,17 +99,17 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                             continue;
                         }
                     };
-                    eprintln!("sending kv msg {msg:?}");
+                    debug!("sending kv msg {msg:?}");
                     match serde_json::to_string(&msg) {
                         Ok(mut outbound) => {
                             outbound.push('\n');
 
                             if let Err(err) = stdout.write_all(outbound.as_bytes()).await {
-                                eprintln!("failed to write kv msg to stdout: {err}");
+                                error!("failed to write kv msg to stdout: {err}");
                             }
                         }
                         Err(err) => {
-                            eprintln!(
+                            error!(
                                 "failed to serialize outbound kv msg {msg:?} before writing: {err}"
                             );
                         }
@@ -135,7 +136,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
             }
             line = stdin.recv() => {
                 let Some(line) = line else {
-                    eprintln!("stdin channel closed");
+                    warn!("stdin channel closed");
                     break
                 };
                 let line = line.context("stdin recv returned error before JSON parsing")?;
@@ -154,6 +155,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                         format!("failed to parse kv payload from raw body: {}", bdy.get())
                     })?;
                     let (_, msg) = msg.replace_body(payload);
+                    debug!("kv processing msg {msg:?}");
                     kv.process(msg).await.context("kv failed to process msg")?;
                     continue;
                 }
@@ -168,17 +170,17 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                 let node = node.clone();
 
                 set.spawn(async move {
-                    eprintln!("handling msg {msg:?}");
+                    debug!("handling msg {msg:?}");
                     let resp = node.handle(msg, tx).await;
                     if let Err(err) = resp {
-                        eprintln!("node handle failed: {err}");
+                        error!("node handle failed: {err}");
                     }
                 });
             }
             supplied = rx_node_supplied.recv(), if supplied_open => {
                 let Some(supplied) = supplied else {
                     supplied_open = false;
-                    eprintln!("supplied channel closed");
+                    warn!("supplied channel closed");
                     continue
                 };
 
@@ -186,10 +188,10 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                 let node = node.clone();
 
                 set.spawn(async move {
-                    eprintln!("handling supplied msg {supplied:?}");
+                    debug!("handling supplied msg {supplied:?}");
                     let resp = node.handle_supplied(supplied, tx).await;
                     if let Err(err) = resp {
-                        eprintln!("node handle supplied failed: {err}");
+                        error!("node handle supplied failed: {err}");
                     }
                 });
 
@@ -198,12 +200,12 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     }
 
     drop(tx_node);
-    eprintln!("about to wait for writer task");
+    info!("about to wait for writer task");
     handle.await.context("writer task panicked")?;
-    eprintln!("about to wait for node");
+    info!("about to wait for node");
     node.stop().await.context("failed to stop node")?;
     kv.stop().await;
-    eprintln!("goodbye!");
+    info!("goodbye!");
 
     Ok(())
 }
@@ -221,7 +223,7 @@ async fn handle_init<N: Node>(
         .context("no line was present for init msg")?;
     let init_msg: Message<Body<PayloadInit>> =
         serde_json::from_str(&line).context("failed to parse init msg")?;
-    eprintln!("recieved init msg: {init_msg:?}");
+    debug!("received init msg: {init_msg:?}");
 
     let Message { src, dst, body } = init_msg;
     let Body {
@@ -267,7 +269,7 @@ fn spawn_stdin() -> Receiver<anyhow::Result<String>> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             if let Err(err) = tx.blocking_send(line.context("failed to read line")) {
-                eprintln!("stdin channel closed after send failure: {err}");
+                warn!("stdin channel closed after send failure: {err}");
                 break;
             }
         }

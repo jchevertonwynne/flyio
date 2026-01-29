@@ -4,6 +4,8 @@ use anyhow::{Context, bail};
 use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
+use tracing::error;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Clone)]
 struct GenerateNode {
@@ -108,5 +110,16 @@ impl Node for GenerateNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<GenerateNode>().await
+    init_tracing();
+    main_loop::<GenerateNode>()
+        .await
+        .inspect_err(|err| error!("failed to run main: {err}"))
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let _ = fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }

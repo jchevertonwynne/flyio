@@ -6,12 +6,20 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
+use tokio::{
+    select,
+    sync::{OnceCell, mpsc::Sender},
+    time::MissedTickBehavior,
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{debug, error, warn};
+use tracing_subscriber::{EnvFilter, fmt};
+
+const COUNTER_KEY: &str = "shared_counter";
 
 #[derive(Clone)]
 struct GrowNode {
@@ -21,98 +29,36 @@ struct GrowNode {
 struct GrowNodeInner {
     id_provider: MsgIDProvider,
     propogate: AtomicU64,
-    flushing: AtomicU64,
-    key_state: AtomicU8,
     kv: KvClient,
     tasks: TaskTracker,
     cancel: CancellationToken,
+    counter_ready: OnceCell<()>,
 }
 
 impl GrowNodeInner {
-    async fn add_to_shared_counter(&self, mut delta: u64) -> anyhow::Result<()> {
+    async fn ensure_counter_ready(&self) -> anyhow::Result<()> {
+        self.counter_ready
+            .get_or_try_init(|| async {
+                self.ensure_counter_exists().await?;
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    async fn ensure_counter_exists(&self) -> anyhow::Result<()> {
         let mut sleep_dur = Duration::from_millis(1);
-        if self.key_state.load(Ordering::SeqCst) == 0 {
-            self.key_state.store(1, Ordering::SeqCst);
-        }
-
-        let mut extra_added = 0;
-
         loop {
-            let p = self.propogate.swap(0, Ordering::SeqCst);
-            if p > 0 {
-                self.flushing.fetch_add(p, Ordering::SeqCst);
-                delta += p;
-                extra_added += p;
-            }
-            let current = match self.kv.read("shared_counter").await {
-                Ok(val) => {
-                    self.key_state.store(2, Ordering::SeqCst);
-                    val
-                }
+            match self.kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
+                Ok(_) => return Ok(()),
                 Err(err) => {
-                    if self.key_state.load(Ordering::SeqCst) == 2 {
-                        eprintln!("failed to read shared counter value (state 2): {err}");
-                        tokio::time::sleep(sleep_dur).await;
-                        sleep_dur = sleep_dur.saturating_mul(2);
-                        continue;
-                    }
-
-                    match self
-                        .kv
-                        .compare_and_swap("shared_counter", 0, delta, true)
-                        .await
-                    {
-                        Ok(true) => {
-                            self.key_state.store(2, Ordering::SeqCst);
-                            self.flushing.fetch_sub(delta, Ordering::SeqCst);
-                            return Ok(());
-                        }
-                        Ok(false) => {
-                            self.key_state.store(2, Ordering::SeqCst);
-                            continue;
-                        }
-                        Err(err) => {
-                            eprintln!("failed to attempt cas for shared counter: {err}");
-                            tokio::time::sleep(sleep_dur).await;
-                            sleep_dur = sleep_dur.saturating_mul(2);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            let new = match current.checked_add(delta) {
-                Some(n) => n,
-                None => {
-                    self.flushing.fetch_sub(extra_added, Ordering::SeqCst);
-                    bail!("shared counter would overflow u64");
-                }
-            };
-
-            match self
-                .kv
-                .compare_and_swap("shared_counter", current, new, false)
-                .await
-            {
-                Ok(true) => {
-                    self.flushing.fetch_sub(delta, Ordering::SeqCst);
-                    break;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    eprintln!("failed to attempt cas for shared counter: {err}");
-                    tokio::time::sleep(sleep_dur).await;
-                    sleep_dur = sleep_dur.saturating_mul(2);
-                    continue;
+                    warn!(?err, "failed to ensure shared counter exists");
                 }
             }
 
-            eprintln!("cas for shared counter failed, retrying in {:?}", sleep_dur);
             tokio::time::sleep(sleep_dur).await;
-            sleep_dur = sleep_dur.saturating_mul(2);
+            sleep_dur = sleep_dur.saturating_mul(2).min(Duration::from_millis(100));
         }
-
-        Ok(())
     }
 }
 
@@ -208,20 +154,31 @@ impl HandleMessage for Read {
                 },
         } = msg;
 
-        let resp_msg_id = node.id_provider.id();
-        let propogate = node.propogate.load(Ordering::SeqCst);
-        let flushing = node.flushing.load(Ordering::SeqCst);
+        node.ensure_counter_ready().await?;
+        let mut sleep_duration = Duration::from_millis(1);
 
-        let value = if node.key_state.load(Ordering::SeqCst) < 2 {
-            0
-        } else {
-            node.kv
-                .read("shared_counter")
-                .await
-                .context("failed to send read request")?
+        let value = loop {
+            let value = node.kv.read(COUNTER_KEY).await?;
+            match node
+                .kv
+                .compare_and_swap(COUNTER_KEY, value, value, false)
+                .await?
+            {
+                true => {
+                    debug!(value, "successful read of shared counter");
+                    break value;
+                }
+                false => {
+                    debug!(value, "retrying read of shared counter after contention");
+                    tokio::time::sleep(sleep_duration).await;
+                    sleep_duration = sleep_duration
+                        .saturating_mul(2)
+                        .min(Duration::from_millis(100));
+                }
+            }
         };
 
-        let value = value + propogate + flushing;
+        let resp_msg_id = node.id_provider.id();
 
         let response = Message {
             src: dst,
@@ -262,7 +219,7 @@ impl HandleMessage for Error {
         _tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { code, text } = self;
-        eprintln!("error payload recieved: code = {code} text = {text}");
+        warn!("error payload recieved: code = {code} text = {text}");
 
         Ok(())
     }
@@ -327,11 +284,10 @@ impl Node for GrowNode {
             inner: Arc::new(GrowNodeInner {
                 id_provider,
                 propogate: AtomicU64::new(0),
-                flushing: AtomicU64::new(0),
                 kv,
                 tasks: tracker,
                 cancel,
-                key_state: AtomicU8::new(0),
+                counter_ready: OnceCell::new(),
             }),
         })
     }
@@ -355,17 +311,41 @@ impl Node for GrowNode {
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Tick = msg;
 
-        let propogate = self.propogate.swap(0, Ordering::SeqCst);
-        if propogate > 0 {
-            self.flushing.fetch_add(propogate, Ordering::SeqCst);
-
-            let res = self.add_to_shared_counter(propogate).await;
-
-            if res.is_err() {
-                self.flushing.fetch_sub(propogate, Ordering::SeqCst);
-                res?;
+        let pending = self.propogate.load(Ordering::SeqCst);
+        if pending > 0 {
+            self.ensure_counter_ready().await?;
+            debug!(pending, "flushing shared counter");
+            let mut value;
+            let mut sleep_duration = Duration::from_millis(1);
+            loop {
+                value = self.kv.read(COUNTER_KEY).await?;
+                let new_value = value + pending;
+                match self
+                    .kv
+                    .compare_and_swap(COUNTER_KEY, value, new_value, false)
+                    .await?
+                {
+                    true => {
+                        debug!(value, new_value, "flushed shared counter successfully");
+                        self.propogate.store(0, Ordering::SeqCst);
+                        break;
+                    }
+                    false => {
+                        debug!(
+                            value,
+                            "contention detected during flush of shared counter, sleeping for {sleep_duration:?}"
+                        );
+                        tokio::time::sleep(sleep_duration).await;
+                        sleep_duration = sleep_duration
+                            .saturating_mul(2)
+                            .min(Duration::from_millis(100));
+                        continue;
+                    }
+                }
             }
         }
+
+        self.kv.compare_and_swap("other key", 0, 0, true).await?;
 
         Ok(())
     }
@@ -379,9 +359,18 @@ impl Node for GrowNode {
     }
 }
 
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let _ = fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     main_loop::<GrowNode>()
         .await
-        .inspect_err(|err| eprintln!("failed to run main: {err}"))
+        .inspect_err(|err| error!("failed to run main: {err}"))
 }

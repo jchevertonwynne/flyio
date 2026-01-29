@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::{debug, error, warn};
 
 use crate::message::{Body, Message};
 
@@ -99,8 +100,15 @@ impl KvClient {
                             let Some(msg) = msg else {
                                 break;
                             };
+                              debug!(
+                                  msg_type = kv_msg_label(&msg),
+                                  waiting_reads = waiting_for_read.len(),
+                                  waiting_writes = waiting_for_write.len(),
+                                  waiting_cas = waiting_for_cas.len(),
+                                  "kv worker dequeued message"
+                              );
                             if let Err(err) = handle_message(msg, &node_id, &id_provider, &mut waiting_for_read, &mut waiting_for_write, &mut waiting_for_cas, &mut tx_payload).await {
-                                eprintln!("failed to handle kv message: {err}");
+                                error!("failed to handle kv message: {err}");
                             };
                         }
                     }
@@ -240,12 +248,15 @@ async fn handle_message(
             let res = waiting_for_read.contains_key(&msg_id)
                 || waiting_for_write.contains_key(&msg_id)
                 || waiting_for_cas.contains_key(&msg_id);
+            debug!(msg_id, res, "kv should_process check");
             if let Err(err) = tx.send(res) {
-                eprintln!("should_process receiver dropped for msg_id {msg_id}: {err}");
+                warn!("should_process receiver dropped for msg_id {msg_id}: {err}");
             }
         }
         KVMsg::Read { key, tx } => {
             let msg_id = id_provider.id();
+            waiting_for_read.insert(msg_id, tx);
+            let waiting_reads = waiting_for_read.len();
             let msg = Message {
                 src: node_id.clone(),
                 dst: "seq-kv".to_string(),
@@ -255,7 +266,7 @@ async fn handle_message(
                     payload: KvPayload::Read { key },
                 },
             };
-            waiting_for_read.insert(msg_id, tx);
+            debug!(msg_id, waiting_reads, "kv sending read request");
             tx_payload
                 .send(msg)
                 .await
@@ -263,6 +274,8 @@ async fn handle_message(
         }
         KVMsg::Write { key, value, tx } => {
             let msg_id = id_provider.id();
+            waiting_for_write.insert(msg_id, tx);
+            let waiting_writes = waiting_for_write.len();
             let msg = Message {
                 src: node_id.clone(),
                 dst: "seq-kv".to_string(),
@@ -272,7 +285,7 @@ async fn handle_message(
                     payload: KvPayload::Write { key, value },
                 },
             };
-            waiting_for_write.insert(msg_id, tx);
+            debug!(msg_id, waiting_writes, "kv sending write request");
             tx_payload
                 .send(msg)
                 .await
@@ -286,6 +299,8 @@ async fn handle_message(
             tx,
         } => {
             let msg_id = id_provider.id();
+            waiting_for_cas.insert(msg_id, tx);
+            let waiting_cas = waiting_for_cas.len();
             let msg = Message {
                 src: node_id.clone(),
                 dst: "seq-kv".to_string(),
@@ -300,7 +315,7 @@ async fn handle_message(
                     },
                 },
             };
-            waiting_for_cas.insert(msg_id, tx);
+            debug!(msg_id, waiting_cas, from, to, "kv sending cas request");
             tx_payload
                 .send(msg)
                 .await
@@ -309,54 +324,96 @@ async fn handle_message(
         KVMsg::ReadResponse { msg_id, value } => {
             if let Some(tx) = waiting_for_read.remove(&msg_id) {
                 if let Err(err) = tx.send(Ok(value)) {
-                    eprintln!("failed to deliver read response for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver read response for msg_id {msg_id}: {err:?}");
                 }
+                debug!(
+                    msg_id,
+                    waiting_reads = waiting_for_read.len(),
+                    value,
+                    "kv delivered read response"
+                );
             } else {
-                eprintln!("no waiting read for msg_id {}", msg_id);
+                warn!("no waiting read for msg_id {msg_id}");
             }
         }
         KVMsg::WriteResponse { msg_id } => {
             if let Some(tx) = waiting_for_write.remove(&msg_id) {
                 if let Err(err) = tx.send(Ok(())) {
-                    eprintln!("failed to deliver write response for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver write response for msg_id {msg_id}: {err:?}");
                 }
+                debug!(
+                    msg_id,
+                    waiting_writes = waiting_for_write.len(),
+                    "kv delivered write response"
+                );
             } else {
-                eprintln!("no waiting write for msg_id {}", msg_id);
+                warn!("no waiting write for msg_id {msg_id}");
             }
         }
         KVMsg::CmpAndSwpResponse { msg_id, swapped } => {
             if let Some(tx) = waiting_for_cas.remove(&msg_id) {
                 if let Err(err) = tx.send(Ok(swapped)) {
-                    eprintln!("failed to deliver cas response for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver cas response for msg_id {msg_id}: {err:?}");
                 }
+                debug!(
+                    msg_id,
+                    waiting_cas = waiting_for_cas.len(),
+                    swapped,
+                    "kv delivered cas response"
+                );
             } else {
-                eprintln!("no waiting cas for msg_id {}", msg_id);
+                warn!("no waiting cas for msg_id {msg_id}");
             }
         }
         KVMsg::ErrorResponse { msg_id, code, text } => {
             let err_msg = format!("kv error code {code}: {text}");
             if let Some(tx) = waiting_for_read.remove(&msg_id) {
                 if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
-                    eprintln!("failed to deliver read error for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver read error for msg_id {msg_id}: {err:?}");
                 }
+                debug!(
+                    msg_id,
+                    waiting_reads = waiting_for_read.len(),
+                    code,
+                    "kv delivered read error"
+                );
             } else if let Some(tx) = waiting_for_write.remove(&msg_id) {
                 if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
-                    eprintln!("failed to deliver write error for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver write error for msg_id {msg_id}: {err:?}");
                 }
+                debug!(
+                    msg_id,
+                    waiting_writes = waiting_for_write.len(),
+                    code,
+                    "kv delivered write error"
+                );
             } else if let Some(tx) = waiting_for_cas.remove(&msg_id) {
                 if code == 22 {
                     if let Err(err) = tx.send(Ok(false)) {
-                        eprintln!(
-                            "failed to deliver cas mismatch result for msg_id {msg_id}: {err:?}"
-                        );
+                        warn!("failed to deliver cas mismatch result for msg_id {msg_id}: {err:?}");
                     }
+                    debug!(
+                        msg_id,
+                        waiting_cas = waiting_for_cas.len(),
+                        code,
+                        "kv delivered cas mismatch"
+                    );
                 } else if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
-                    eprintln!("failed to deliver cas error for msg_id {msg_id}: {err:?}");
+                    warn!("failed to deliver cas error for msg_id {msg_id}: {err:?}");
+                } else {
+                    debug!(
+                        msg_id,
+                        waiting_cas = waiting_for_cas.len(),
+                        code,
+                        "kv delivered cas error"
+                    );
                 }
             } else {
-                eprintln!(
-                    "received kv error response for unknown msg_id {}: {}",
-                    msg_id, err_msg
+                warn!(
+                    waiting_reads = waiting_for_read.len(),
+                    waiting_writes = waiting_for_write.len(),
+                    waiting_cas = waiting_for_cas.len(),
+                    "received kv error response for unknown msg_id {msg_id}: {err_msg}"
                 );
             }
         }
@@ -389,4 +446,17 @@ pub enum KvPayload {
         code: u16,
         text: String,
     },
+}
+
+fn kv_msg_label(msg: &KVMsg) -> &'static str {
+    match msg {
+        KVMsg::ShouldProcess { .. } => "should_process",
+        KVMsg::Read { .. } => "read",
+        KVMsg::ReadResponse { .. } => "read_response",
+        KVMsg::Write { .. } => "write",
+        KVMsg::WriteResponse { .. } => "write_response",
+        KVMsg::CmpAndSwp { .. } => "cas",
+        KVMsg::CmpAndSwpResponse { .. } => "cas_response",
+        KVMsg::ErrorResponse { .. } => "error_response",
+    }
 }

@@ -13,6 +13,8 @@ use tokio::{
     sync::{Mutex, mpsc::Sender},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::error;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Clone)]
 struct BroadcastNode {
@@ -402,5 +404,16 @@ impl Node for BroadcastNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<BroadcastNode>().await
+    init_tracing();
+    main_loop::<BroadcastNode>()
+        .await
+        .inspect_err(|err| error!("failed to run main: {err}"))
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let _ = fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
