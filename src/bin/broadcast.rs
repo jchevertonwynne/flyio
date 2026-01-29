@@ -1,17 +1,13 @@
+use anyhow::{Context, bail};
+use enum_dispatch::enum_dispatch;
+use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
-
-use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, Message, Node, main_loop};
-use serde::{Deserialize, Serialize};
 use tokio::{
     select,
     sync::{Mutex, mpsc::Sender},
@@ -25,7 +21,7 @@ struct BroadcastNode {
 
 struct BroadcastNodeInner {
     node_id: String,
-    msg_id: AtomicU64,
+    id_provider: MsgIDProvider,
     seen_complete: Mutex<HashSet<u64>>,
     seen: Mutex<HashMap<u64, String>>,
     neighbours: Mutex<HashSet<String>>,
@@ -63,9 +59,9 @@ struct Broadcast {
 impl HandleMessage for Broadcast {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &BroadcastNode,
-        tx: Sender<Message<BroadcastNodePayload>>,
+        tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { message } = self;
         let Message {
@@ -79,7 +75,7 @@ impl HandleMessage for Broadcast {
                 },
         } = msg;
 
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
+        let resp_msg_id = node.id_provider.id();
         node.seen.lock().await.entry(message).or_insert(src.clone());
 
         let response = Message {
@@ -111,9 +107,9 @@ struct Read;
 impl HandleMessage for Read {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &BroadcastNode,
-        tx: Sender<Message<BroadcastNodePayload>>,
+        tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self {} = self;
         let Message {
@@ -127,7 +123,7 @@ impl HandleMessage for Read {
                 },
         } = msg;
 
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
+        let resp_msg_id = node.id_provider.id();
         let seen = node.seen.lock().await;
         let mut messages: HashSet<u64> = seen.keys().copied().collect();
         messages.extend(node.seen_complete.lock().await.iter().cloned());
@@ -165,9 +161,9 @@ struct Topology {
 impl HandleMessage for Topology {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &BroadcastNode,
-        tx: Sender<Message<BroadcastNodePayload>>,
+        tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { mut topology } = self;
         let Message {
@@ -181,7 +177,7 @@ impl HandleMessage for Topology {
                 },
         } = msg;
 
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
+        let resp_msg_id = node.id_provider.id();
         let Some(neighbours) = topology.remove(&node.node_id) else {
             bail!("malformed topology msg");
         };
@@ -221,9 +217,9 @@ struct SendMin {
 impl HandleMessage for SendMin {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &BroadcastNode,
-        _tx: Sender<Message<BroadcastNodePayload>>,
+        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { messages } = self;
         let Message {
@@ -259,9 +255,9 @@ enum SuppliedPayload {
 trait HandleMessage: Sized {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &BroadcastNode,
-        tx: Sender<Message<BroadcastNodePayload>>,
+        tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
         _ = msg;
         _ = node;
@@ -274,7 +270,12 @@ impl Node for BroadcastNode {
     type Payload = BroadcastNodePayload;
     type PayloadSupplied = SuppliedPayload;
 
-    fn from_init(init: Init, tx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
+    async fn from_init(
+        init: Init,
+        _kv: KvClient,
+        id_provider: MsgIDProvider,
+        tx: Sender<Self::PayloadSupplied>,
+    ) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,
@@ -306,7 +307,7 @@ impl Node for BroadcastNode {
         Ok(BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {
                 node_id,
-                msg_id: AtomicU64::new(1),
+                id_provider,
                 seen_complete: Mutex::new(HashSet::new()),
                 seen: Mutex::new(HashMap::new()),
                 neighbours: Mutex::new(HashSet::new()),
@@ -318,8 +319,8 @@ impl Node for BroadcastNode {
 
     async fn handle(
         &self,
-        msg: Message<Self::Payload>,
-        tx: Sender<Message<Self::Payload>>,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let Message {
             src,
@@ -350,7 +351,7 @@ impl Node for BroadcastNode {
     async fn handle_supplied(
         &self,
         msg: Self::PayloadSupplied,
-        tx: Sender<Message<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Gossip = msg;
 
@@ -373,7 +374,7 @@ impl Node for BroadcastNode {
         }
 
         for (unseen_neighbour, messages) in need_to_send {
-            let msg_id = self.msg_id.fetch_add(1, Ordering::SeqCst);
+            let msg_id = self.id_provider.id();
             tx.send(Message {
                 src: self.node_id.clone(),
                 dst: unseen_neighbour,

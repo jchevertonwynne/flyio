@@ -1,25 +1,17 @@
+use anyhow::{Context, bail};
+use enum_dispatch::enum_dispatch;
+use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroUsize,
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-
-use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, Message, Node, main_loop};
-use lru::LruCache;
-use serde::{Deserialize, Serialize};
-use tokio::{
-    select,
-    sync::{Mutex, mpsc::Sender},
-};
+use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use uuid::Uuid;
 
 #[derive(Clone)]
 struct GrowNode {
@@ -27,15 +19,101 @@ struct GrowNode {
 }
 
 struct GrowNodeInner {
-    node_id: String,
-    neighbours: HashSet<String>,
-    msg_id: AtomicU64,
-    number: AtomicU64,
+    id_provider: MsgIDProvider,
     propogate: AtomicU64,
-    waiting_list: Mutex<HashMap<Uuid, WaitingListRecord>>,
-    seen: Mutex<LruCache<Uuid, ()>>,
+    flushing: AtomicU64,
+    key_state: AtomicU8,
+    kv: KvClient,
     tasks: TaskTracker,
     cancel: CancellationToken,
+}
+
+impl GrowNodeInner {
+    async fn add_to_shared_counter(&self, mut delta: u64) -> anyhow::Result<()> {
+        let mut sleep_dur = Duration::from_millis(1);
+        if self.key_state.load(Ordering::SeqCst) == 0 {
+            self.key_state.store(1, Ordering::SeqCst);
+        }
+
+        let mut extra_added = 0;
+
+        loop {
+            let p = self.propogate.swap(0, Ordering::SeqCst);
+            if p > 0 {
+                self.flushing.fetch_add(p, Ordering::SeqCst);
+                delta += p;
+                extra_added += p;
+            }
+            let current = match self.kv.read("shared_counter").await {
+                Ok(val) => {
+                    self.key_state.store(2, Ordering::SeqCst);
+                    val
+                }
+                Err(err) => {
+                    if self.key_state.load(Ordering::SeqCst) == 2 {
+                        eprintln!("failed to read shared counter value (state 2): {err}");
+                        tokio::time::sleep(sleep_dur).await;
+                        sleep_dur = sleep_dur.saturating_mul(2);
+                        continue;
+                    }
+
+                    match self
+                        .kv
+                        .compare_and_swap("shared_counter", 0, delta, true)
+                        .await
+                    {
+                        Ok(true) => {
+                            self.key_state.store(2, Ordering::SeqCst);
+                            self.flushing.fetch_sub(delta, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            self.key_state.store(2, Ordering::SeqCst);
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("failed to attempt cas for shared counter: {err}");
+                            tokio::time::sleep(sleep_dur).await;
+                            sleep_dur = sleep_dur.saturating_mul(2);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let new = match current.checked_add(delta) {
+                Some(n) => n,
+                None => {
+                    self.flushing.fetch_sub(extra_added, Ordering::SeqCst);
+                    bail!("shared counter would overflow u64");
+                }
+            };
+
+            match self
+                .kv
+                .compare_and_swap("shared_counter", current, new, false)
+                .await
+            {
+                Ok(true) => {
+                    self.flushing.fetch_sub(delta, Ordering::SeqCst);
+                    break;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    eprintln!("failed to attempt cas for shared counter: {err}");
+                    tokio::time::sleep(sleep_dur).await;
+                    sleep_dur = sleep_dur.saturating_mul(2);
+                    continue;
+                }
+            }
+
+            eprintln!("cas for shared counter failed, retrying in {:?}", sleep_dur);
+            tokio::time::sleep(sleep_dur).await;
+            sleep_dur = sleep_dur.saturating_mul(2);
+        }
+
+        Ok(())
+    }
 }
 
 impl Deref for GrowNode {
@@ -46,12 +124,6 @@ impl Deref for GrowNode {
     }
 }
 
-struct WaitingListRecord {
-    delta: u64,
-    last_sent: Instant,
-    waiting_for: HashSet<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[enum_dispatch(HandleMessage)]
@@ -60,8 +132,6 @@ enum GrowNodePayload {
     AddOk(AddOk),
     Read(Read),
     ReadOk(ReadOk),
-    PropogateCrawl(PropogateCrawl),
-    PropogateCrawlOk(PropogateCrawlOk),
     Error(Error),
 }
 
@@ -74,9 +144,9 @@ struct Add {
 impl HandleMessage for Add {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<GrowNodePayload>>,
+        tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { delta: message } = self;
         let Message {
@@ -90,10 +160,9 @@ impl HandleMessage for Add {
                 },
         } = msg;
 
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-
-        node.number.fetch_add(message, Ordering::SeqCst);
         node.propogate.fetch_add(message, Ordering::SeqCst);
+
+        let resp_msg_id = node.id_provider.id();
 
         let response = Message {
             src: dst,
@@ -124,9 +193,9 @@ struct Read;
 impl HandleMessage for Read {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<GrowNodePayload>>,
+        tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Message {
             src,
@@ -139,8 +208,20 @@ impl HandleMessage for Read {
                 },
         } = msg;
 
-        let resp_msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-        let value = node.number.load(Ordering::SeqCst);
+        let resp_msg_id = node.id_provider.id();
+        let propogate = node.propogate.load(Ordering::SeqCst);
+        let flushing = node.flushing.load(Ordering::SeqCst);
+
+        let value = if node.key_state.load(Ordering::SeqCst) < 2 {
+            0
+        } else {
+            node.kv
+                .read("shared_counter")
+                .await
+                .context("failed to send read request")?
+        };
+
+        let value = value + propogate + flushing;
 
         let response = Message {
             src: dst,
@@ -168,160 +249,6 @@ impl HandleMessage for ReadOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct PropogateCrawl {
-    crawl_uuid: Uuid,
-    source: String,
-    target: String,
-    delta: u64,
-    trail: Vec<String>,
-    next: HashSet<String>,
-}
-
-impl HandleMessage for PropogateCrawl {
-    async fn handle(
-        self,
-        msg: Message<()>,
-        node: &GrowNode,
-        tx: Sender<Message<GrowNodePayload>>,
-    ) -> anyhow::Result<()> {
-        let Self {
-            crawl_uuid,
-            source,
-            target,
-            delta,
-            mut trail,
-            next,
-        } = self;
-        let Message {
-            src: _,
-            dst: _,
-            body:
-                Body {
-                    incoming_msg_id,
-                    in_reply_to: _,
-                    payload: _,
-                },
-        } = msg;
-
-        if node.node_id == target && node.seen.lock().await.put(crawl_uuid, ()).is_none() {
-            node.number.fetch_add(delta, Ordering::SeqCst);
-            for neighbour in node.neighbours.iter().cloned() {
-                let msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-                let mut next = node.neighbours.clone();
-                next.retain(|n| n != &node.node_id);
-                let msg = Message {
-                    src: node.node_id.clone(),
-                    dst: neighbour,
-                    body: Body {
-                        incoming_msg_id: Some(msg_id),
-                        in_reply_to: incoming_msg_id,
-                        payload: GrowNodePayload::PropogateCrawlOk(PropogateCrawlOk {
-                            crawl_uuid,
-                            source: node.node_id.clone(),
-                            target: target.clone(),
-                            next,
-                        }),
-                    },
-                };
-                tx.send(msg).await.context("failed to send msg")?;
-            }
-            return Ok(());
-        }
-
-        trail.push(node.node_id.clone());
-
-        for next_neighbour in next.iter().cloned() {
-            let msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-
-            let trail = trail.clone();
-            let mut next = next.clone();
-            next.retain(|id| id != &node.node_id);
-
-            let msg = Message {
-                src: node.node_id.clone(),
-                dst: next_neighbour,
-                body: Body {
-                    incoming_msg_id: Some(msg_id),
-                    in_reply_to: incoming_msg_id,
-                    payload: GrowNodePayload::PropogateCrawl(PropogateCrawl {
-                        crawl_uuid,
-                        source: node.node_id.clone(),
-                        target: source.clone(),
-                        delta,
-                        trail,
-                        next,
-                    }),
-                },
-            };
-            tx.send(msg)
-                .await
-                .context("failed to send propogate message")?;
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct PropogateCrawlOk {
-    crawl_uuid: Uuid,
-    source: String,
-    target: String,
-    next: HashSet<String>,
-}
-
-impl HandleMessage for PropogateCrawlOk {
-    async fn handle(
-        self,
-        _msg: Message<()>,
-        node: &GrowNode,
-        tx: Sender<Message<GrowNodePayload>>,
-    ) -> anyhow::Result<()> {
-        let Self {
-            crawl_uuid,
-            source,
-            target,
-            next,
-        } = self;
-
-        if target == node.node_id {
-            let mut waiting_list = node.waiting_list.lock().await;
-            let Some(record) = waiting_list.get_mut(&crawl_uuid) else {
-                return Ok(());
-            };
-            record.waiting_for.remove(&source);
-            // remove from map
-            return Ok(());
-        }
-
-        for dst in next.iter().cloned() {
-            let mut next = next.clone();
-            next.remove(&dst);
-            let msg_id = node.msg_id.fetch_add(1, Ordering::SeqCst);
-            let message = Message {
-                src: node.node_id.clone(),
-                dst,
-                body: Body {
-                    incoming_msg_id: Some(msg_id),
-                    in_reply_to: None,
-                    payload: GrowNodePayload::PropogateCrawlOk(PropogateCrawlOk {
-                        crawl_uuid,
-                        source: source.clone(),
-                        target: target.clone(),
-                        next,
-                    }),
-                },
-            };
-            tx.send(message).await.context("failed to send msg")?;
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 struct Error {
     code: u64,
     text: String,
@@ -330,9 +257,9 @@ struct Error {
 impl HandleMessage for Error {
     async fn handle(
         self,
-        _msg: Message<()>,
+        _msg: Message<Body<()>>,
         _node: &GrowNode,
-        _tx: Sender<Message<GrowNodePayload>>,
+        _tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
         let Self { code, text } = self;
         eprintln!("error payload recieved: code = {code} text = {text}");
@@ -350,9 +277,9 @@ enum SuppliedPayload {
 trait HandleMessage: Sized {
     async fn handle(
         self,
-        msg: Message<()>,
+        msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<GrowNodePayload>>,
+        tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
         _ = msg;
         _ = node;
@@ -365,12 +292,12 @@ impl Node for GrowNode {
     type Payload = GrowNodePayload;
     type PayloadSupplied = SuppliedPayload;
 
-    fn from_init(init: Init, tx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
-        let Init { node_id, node_ids } = init;
-
-        let mut neighbours = node_ids;
-        neighbours.retain(|n| n != &node_id);
-
+    async fn from_init(
+        _init: Init,
+        kv: KvClient,
+        id_provider: MsgIDProvider,
+        tx: Sender<Self::PayloadSupplied>,
+    ) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
@@ -378,6 +305,8 @@ impl Node for GrowNode {
             let cancel = cancel.clone();
             async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(100));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
                 loop {
                     select! {
                         _ = ticker.tick() => {
@@ -396,28 +325,25 @@ impl Node for GrowNode {
 
         Ok(GrowNode {
             inner: Arc::new(GrowNodeInner {
-                node_id,
-                neighbours,
-                msg_id: AtomicU64::new(1),
-                number: AtomicU64::new(0),
+                id_provider,
                 propogate: AtomicU64::new(0),
-                waiting_list: Mutex::new(HashMap::new()),
-                seen: Mutex::new(LruCache::new(
-                    NonZeroUsize::new(1024).context("NZU invalud")?,
-                )),
+                flushing: AtomicU64::new(0),
+                kv,
                 tasks: tracker,
                 cancel,
+                key_state: AtomicU8::new(0),
             }),
         })
     }
 
     async fn handle(
         &self,
-        msg: Message<Self::Payload>,
-        tx: Sender<Message<Self::Payload>>,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
-        let (payload, msg) = msg.extract_payload();
-        payload.handle(msg, self, tx).await?;
+        let (payload, message) = msg.replace_payload(());
+
+        payload.handle(message, self, tx).await?;
 
         Ok(())
     }
@@ -425,80 +351,21 @@ impl Node for GrowNode {
     async fn handle_supplied(
         &self,
         msg: Self::PayloadSupplied,
-        tx: Sender<Message<Self::Payload>>,
+        _tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Tick = msg;
 
-        for (&crawl_uuid, record) in self.waiting_list.lock().await.iter_mut() {
-            if record.last_sent.elapsed() > Duration::from_secs(1) {
-                let delta = record.delta;
-                eprintln!(
-                    "retrying to send delta {delta} to neighbours {:?}",
-                    record.waiting_for
-                );
+        let propogate = self.propogate.swap(0, Ordering::SeqCst);
+        if propogate > 0 {
+            self.flushing.fetch_add(propogate, Ordering::SeqCst);
 
-                for neighbour in record.waiting_for.iter().cloned() {
-                    let msg_id = self.msg_id.fetch_add(1, Ordering::SeqCst);
-                    tx.send(Message {
-                        src: self.node_id.clone(),
-                        dst: neighbour.clone(),
-                        body: Body {
-                            incoming_msg_id: Some(msg_id),
-                            in_reply_to: None,
-                            payload: GrowNodePayload::PropogateCrawl(PropogateCrawl {
-                                crawl_uuid,
-                                source: self.node_id.clone(),
-                                target: neighbour,
-                                delta,
-                                trail: vec![self.node_id.clone()],
-                                next: self.neighbours.clone(),
-                            }),
-                        },
-                    })
-                    .await
-                    .context("failed to send supplied msg")?;
-                }
+            let res = self.add_to_shared_counter(propogate).await;
 
-                record.last_sent = Instant::now();
+            if res.is_err() {
+                self.flushing.fetch_sub(propogate, Ordering::SeqCst);
+                res?;
             }
         }
-
-        let delta = self.propogate.swap(0, Ordering::SeqCst);
-        if delta == 0 {
-            return Ok(());
-        }
-
-        let crawl_uuid = Uuid::new_v4();
-        for target in self.neighbours.iter().cloned() {
-            let msg_id = self.msg_id.fetch_add(1, Ordering::SeqCst);
-            let trail = vec![self.node_id.clone()];
-            let next = self.neighbours.clone();
-            tx.send(Message {
-                src: self.node_id.clone(),
-                dst: target.clone(),
-                body: Body {
-                    incoming_msg_id: Some(msg_id),
-                    in_reply_to: None,
-                    payload: GrowNodePayload::PropogateCrawl(PropogateCrawl {
-                        crawl_uuid,
-                        source: self.node_id.clone(),
-                        target,
-                        delta,
-                        trail,
-                        next,
-                    }),
-                },
-            })
-            .await
-            .context("failed to send supplied msg")?;
-        }
-
-        let record = WaitingListRecord {
-            delta,
-            last_sent: Instant::now(),
-            waiting_for: self.neighbours.clone(),
-        };
-        self.waiting_list.lock().await.insert(crawl_uuid, record);
 
         Ok(())
     }
@@ -514,5 +381,7 @@ impl Node for GrowNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<GrowNode>().await
+    main_loop::<GrowNode>()
+        .await
+        .inspect_err(|err| eprintln!("failed to run main: {err}"))
 }

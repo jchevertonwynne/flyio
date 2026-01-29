@@ -1,32 +1,12 @@
-use std::{
-    convert::Infallible,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
-
 use anyhow::{Context, bail};
-use flyio::{Body, Init, Message, Node, main_loop};
+use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use tokio::sync::mpsc::Sender;
 
 #[derive(Clone)]
 struct EchoNode {
-    inner: Arc<EchoNodeInner>,
-}
-
-struct EchoNodeInner {
-    id: AtomicU64,
-}
-
-impl Deref for EchoNode {
-    type Target = EchoNodeInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
+    id_provider: MsgIDProvider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,18 +20,19 @@ impl Node for EchoNode {
     type Payload = EchoPayload;
     type PayloadSupplied = Infallible;
 
-    fn from_init(_init: Init, _tx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
-        Ok(EchoNode {
-            inner: Arc::new(EchoNodeInner {
-                id: AtomicU64::new(1),
-            }),
-        })
+    async fn from_init(
+        _init: Init,
+        _kv: KvClient,
+        id_provider: MsgIDProvider,
+        _tx: Sender<Self::PayloadSupplied>,
+    ) -> anyhow::Result<Self> {
+        Ok(EchoNode { id_provider })
     }
 
     async fn handle(
         &self,
-        msg: Message<Self::Payload>,
-        tx: Sender<Message<Self::Payload>>,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let Message { src, dst, body } = msg;
         let Body {
@@ -62,7 +43,7 @@ impl Node for EchoNode {
 
         match payload {
             EchoPayload::Echo { echo } => {
-                let resp_msg_id = self.id.fetch_add(1, Ordering::SeqCst);
+                let resp_msg_id = self.id_provider.id();
                 let response = Message {
                     src: dst,
                     dst: src,
@@ -84,7 +65,7 @@ impl Node for EchoNode {
     async fn handle_supplied(
         &self,
         _msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Self::Payload>>,
+        _tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         bail!("this should never receive supplied events")
     }

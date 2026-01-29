@@ -1,14 +1,7 @@
-use std::{
-    convert::Infallible,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{convert::Infallible, ops::Deref, sync::Arc};
 
 use anyhow::{Context, bail};
-use flyio::{Body, Init, Message, Node, main_loop};
+use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
@@ -19,7 +12,7 @@ struct GenerateNode {
 
 struct GenerateNodeInner {
     node_id: String,
-    msg_id: AtomicU64,
+    id_provider: MsgIDProvider,
 }
 
 impl Deref for GenerateNode {
@@ -41,7 +34,12 @@ impl Node for GenerateNode {
     type Payload = GeneratePayload;
     type PayloadSupplied = Infallible;
 
-    fn from_init(init: Init, _rx: Sender<Self::PayloadSupplied>) -> anyhow::Result<Self> {
+    async fn from_init(
+        init: Init,
+        _kv: KvClient,
+        id_provider: MsgIDProvider,
+        _tx: Sender<Self::PayloadSupplied>,
+    ) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,
@@ -50,15 +48,15 @@ impl Node for GenerateNode {
         Ok(GenerateNode {
             inner: Arc::new(GenerateNodeInner {
                 node_id,
-                msg_id: AtomicU64::new(1),
+                id_provider,
             }),
         })
     }
 
     async fn handle(
         &self,
-        msg: Message<Self::Payload>,
-        tx: Sender<Message<Self::Payload>>,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let Message {
             src,
@@ -73,7 +71,7 @@ impl Node for GenerateNode {
 
         match payload {
             GeneratePayload::Generate => {
-                let resp_msg_id = self.msg_id.fetch_add(1, Ordering::SeqCst);
+                let resp_msg_id = self.id_provider.id();
 
                 let response = Message {
                     src: dst,
@@ -98,7 +96,7 @@ impl Node for GenerateNode {
     async fn handle_supplied(
         &self,
         _msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Self::Payload>>,
+        _tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         bail!("should never be supplied other messages")
     }
