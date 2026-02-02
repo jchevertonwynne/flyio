@@ -1,10 +1,9 @@
 use anyhow::{Context, bail};
-use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use tokio::sync::mpsc::Sender;
 use tracing::error;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Clone)]
 struct EchoNode {
@@ -21,10 +20,11 @@ enum EchoPayload {
 impl Node for EchoNode {
     type Payload = EchoPayload;
     type PayloadSupplied = Infallible;
+    type Service = ();
 
     async fn from_init(
         _init: Init,
-        _kv: KvClient,
+        _services: (),
         id_provider: MsgIDProvider,
         _tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
@@ -79,17 +79,7 @@ impl Node for EchoNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     main_loop::<EchoNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
-}
-
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let _ = fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
 }

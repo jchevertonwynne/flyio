@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, SeqKvClient, main_loop};
 use serde::{Deserialize, Serialize};
 use std::{
     ops::Deref,
@@ -13,7 +13,6 @@ use std::{
 use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, warn};
-use tracing_subscriber::{EnvFilter, fmt};
 
 const COUNTER_KEY: &str = "shared_counter";
 
@@ -26,7 +25,7 @@ struct GrowNodeInner {
     node_id: String,
     id_provider: MsgIDProvider,
     propogate: AtomicU64,
-    kv: KvClient,
+    kv: SeqKvClient,
     tasks: TaskTracker,
     cancel: CancellationToken,
 }
@@ -246,17 +245,19 @@ trait HandleMessage: Sized {
 impl Node for GrowNode {
     type Payload = GrowNodePayload;
     type PayloadSupplied = SuppliedPayload;
+    type Service = SeqKvClient;
 
     async fn from_init(
         init: Init,
-        kv: KvClient,
+        kv: SeqKvClient,
         id_provider: MsgIDProvider,
         tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
         loop {
             match kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
                 Ok(_) => break,
-                Err(_) => {}
+                Err(flyio::KvError::KeyDoesNotExist) => {}
+                Err(e) => return Err(e).context("failed to init counter"),
             }
         }
 
@@ -332,18 +333,8 @@ impl Node for GrowNode {
     }
 }
 
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let _ = fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     main_loop::<GrowNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))

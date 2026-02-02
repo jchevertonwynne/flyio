@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::select;
@@ -11,6 +12,34 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, warn};
 
 use crate::message::{Body, Message};
+
+pub trait StoreName {
+    fn name() -> &'static str;
+}
+
+#[derive(Debug, Clone)]
+pub struct SeqStore;
+impl StoreName for SeqStore {
+    fn name() -> &'static str {
+        "seq-kv"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LinStore;
+impl StoreName for LinStore {
+    fn name() -> &'static str {
+        "lin-kv"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LwwStore;
+impl StoreName for LwwStore {
+    fn name() -> &'static str {
+        "lww-kv"
+    }
+}
 
 #[derive(Debug)]
 pub enum KvError {
@@ -58,11 +87,16 @@ impl MsgIDProvider {
 }
 
 #[derive(Debug, Clone)]
-pub struct KvClient {
+pub struct KvClient<S> {
     tx: Sender<KVMsg>,
     cancel: CancellationToken,
     tm: TaskTracker,
+    _marker: PhantomData<S>,
 }
+
+pub type SeqKvClient = KvClient<SeqStore>;
+pub type LinKvClient = KvClient<LinStore>;
+pub type LwwKvClient = KvClient<LwwStore>;
 
 #[derive(Debug)]
 enum KVMsg {
@@ -104,12 +138,12 @@ enum KVMsg {
     },
 }
 
-impl KvClient {
+impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
     pub fn new(
         id_provider: MsgIDProvider,
         node_id: String,
         mut tx_payload: Sender<Message<Body<KvPayload>>>,
-    ) -> KvClient {
+    ) -> Self {
         let (tx, mut rx) = channel(1);
         let tm = TaskTracker::new();
         let cancel = CancellationToken::new();
@@ -136,7 +170,7 @@ impl KvClient {
                                   waiting_cas = waiting_for_cas.len(),
                                   "kv worker dequeued message"
                               );
-                            if let Err(err) = handle_message(msg, &node_id, &id_provider, &mut waiting_for_read, &mut waiting_for_write, &mut waiting_for_cas, &mut tx_payload).await {
+                            if let Err(err) = handle_message(msg, &node_id, S::name(), &id_provider, &mut waiting_for_read, &mut waiting_for_write, &mut waiting_for_cas, &mut tx_payload).await {
                                 error!("failed to handle kv message: {err}");
                             };
                         }
@@ -144,7 +178,12 @@ impl KvClient {
                 }
             }
         });
-        KvClient { tx, cancel, tm }
+        KvClient {
+            tx,
+            cancel,
+            tm,
+            _marker: PhantomData,
+        }
     }
 
     pub async fn should_process(&self, msg_id: u64) -> anyhow::Result<bool> {
@@ -275,6 +314,7 @@ impl KvClient {
 async fn handle_message(
     msg: KVMsg,
     node_id: &String,
+    store_name: &str,
     id_provider: &MsgIDProvider,
     waiting_for_read: &mut HashMap<u64, oneshot::Sender<Result<u64, KvError>>>,
     waiting_for_write: &mut HashMap<u64, oneshot::Sender<Result<(), KvError>>>,
@@ -297,7 +337,7 @@ async fn handle_message(
             let waiting_reads = waiting_for_read.len();
             let msg = Message {
                 src: node_id.clone(),
-                dst: "seq-kv".to_string(),
+                dst: store_name.to_string(),
                 body: Body {
                     incoming_msg_id: Some(msg_id),
                     in_reply_to: None,
@@ -316,7 +356,7 @@ async fn handle_message(
             let waiting_writes = waiting_for_write.len();
             let msg = Message {
                 src: node_id.clone(),
-                dst: "seq-kv".to_string(),
+                dst: store_name.to_string(),
                 body: Body {
                     incoming_msg_id: Some(msg_id),
                     in_reply_to: None,
@@ -341,7 +381,7 @@ async fn handle_message(
             let waiting_cas = waiting_for_cas.len();
             let msg = Message {
                 src: node_id.clone(),
-                dst: "seq-kv".to_string(),
+                dst: store_name.to_string(),
                 body: Body {
                     incoming_msg_id: Some(msg_id),
                     in_reply_to: None,
@@ -467,6 +507,159 @@ async fn handle_message(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct TsoClient {
+    tx: Sender<TsoMsg>,
+    cancel: CancellationToken,
+    tm: TaskTracker,
+}
+
+#[derive(Debug)]
+enum TsoMsg {
+    ShouldProcess {
+        msg_id: u64,
+        tx: oneshot::Sender<bool>,
+    },
+    Ts {
+        tx: oneshot::Sender<Result<u64, KvError>>,
+    },
+    TsOk {
+        msg_id: u64,
+        ts: u64,
+    },
+}
+
+impl TsoClient {
+    pub fn new(
+        id_provider: MsgIDProvider,
+        node_id: String,
+        mut tx_payload: Sender<Message<Body<KvPayload>>>,
+    ) -> Self {
+        let (tx, mut rx) = channel(1);
+        let tm = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        tm.spawn({
+            let cancel = cancel.clone();
+            async move {
+                let mut waiting_for_ts =
+                    HashMap::<u64, oneshot::Sender<Result<u64, KvError>>>::new();
+                loop {
+                    select! {
+                        _ = cancel.cancelled() => break,
+                        msg = rx.recv() => {
+                            let Some(msg) = msg else {
+                                break;
+                            };
+                            if let Err(err) = handle_tso_message(msg, &node_id, &id_provider, &mut waiting_for_ts, &mut tx_payload).await {
+                                error!("failed to handle tso message: {err}");
+                            };
+                        }
+                    }
+                }
+            }
+        });
+        TsoClient { tx, cancel, tm }
+    }
+
+    pub async fn should_process(&self, msg_id: u64) -> anyhow::Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(TsoMsg::ShouldProcess { msg_id, tx })
+            .await
+            .context("failed to send msg")?;
+        rx.await.context("failed to receive")
+    }
+
+    pub async fn ts(&self) -> Result<u64, KvError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(TsoMsg::Ts { tx })
+            .await
+            .context("failed to send ts msg")
+            .map_err(KvError::Internal)?;
+        rx.await
+            .context("failed to receive ts response")
+            .map_err(KvError::Internal)?
+    }
+
+    pub async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
+        let Message {
+            body:
+                Body {
+                    in_reply_to,
+                    payload,
+                    ..
+                },
+            ..
+        } = msg;
+        if let Some(in_reply_to) = in_reply_to {
+            match payload {
+                KvPayload::TsOk { ts } => {
+                    self.tx
+                        .send(TsoMsg::TsOk {
+                            msg_id: in_reply_to,
+                            ts,
+                        })
+                        .await
+                        .context("failed to send ts response")?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        self.cancel.cancel();
+        self.tm.close();
+        self.tm.wait().await;
+    }
+}
+
+async fn handle_tso_message(
+    msg: TsoMsg,
+    node_id: &String,
+    id_provider: &MsgIDProvider,
+    waiting_for_ts: &mut HashMap<u64, oneshot::Sender<Result<u64, KvError>>>,
+    tx_payload: &mut Sender<Message<Body<KvPayload>>>,
+) -> anyhow::Result<()> {
+    match msg {
+        TsoMsg::ShouldProcess { msg_id, tx } => {
+            let res = waiting_for_ts.contains_key(&msg_id);
+            if let Err(err) = tx.send(res) {
+                warn!("should_process receiver dropped for msg_id {msg_id}: {err}");
+            }
+        }
+        TsoMsg::Ts { tx } => {
+            let msg_id = id_provider.id();
+            waiting_for_ts.insert(msg_id, tx);
+            let msg = Message {
+                src: node_id.clone(),
+                dst: "lin-tso".to_string(),
+                body: Body {
+                    incoming_msg_id: Some(msg_id),
+                    in_reply_to: None,
+                    payload: KvPayload::Ts,
+                },
+            };
+            tx_payload
+                .send(msg)
+                .await
+                .context("failed to send ts msg")?;
+        }
+        TsoMsg::TsOk { msg_id, ts } => {
+            if let Some(tx) = waiting_for_ts.remove(&msg_id) {
+                if let Err(_) = tx.send(Ok(ts)) {
+                    warn!("failed to deliver ts response");
+                }
+            } else {
+                warn!("no waiting ts for msg_id {msg_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KvPayload {
@@ -491,6 +684,10 @@ pub enum KvPayload {
     Error {
         code: u16,
         text: String,
+    },
+    Ts,
+    TsOk {
+        ts: u64,
     },
 }
 

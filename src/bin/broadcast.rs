@@ -1,9 +1,9 @@
 use anyhow::{Context, bail};
 use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, KvClient, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Deref,
     sync::Arc,
     time::Duration,
@@ -14,7 +14,6 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::error;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Clone)]
 struct BroadcastNode {
@@ -25,10 +24,48 @@ struct BroadcastNodeInner {
     node_id: String,
     id_provider: MsgIDProvider,
     seen_complete: Mutex<HashSet<u64>>,
+    completed_order: Mutex<VecDeque<u64>>,
     seen: Mutex<HashMap<u64, String>>,
     neighbours: Mutex<HashSet<String>>,
     tasks: TaskTracker,
     cancel: CancellationToken,
+}
+
+const SEEN_COMPLETE_LIMIT: usize = 10_000;
+
+impl BroadcastNodeInner {
+    async fn snapshot_messages(&self) -> HashSet<u64> {
+        let mut messages = {
+            let complete = self.seen_complete.lock().await;
+            complete.clone()
+        };
+
+        messages.extend(self.seen.lock().await.keys().copied());
+        messages
+    }
+
+    async fn record_completion(&self, message: u64) {
+        {
+            let mut complete = self.seen_complete.lock().await;
+            if !complete.insert(message) {
+                return;
+            }
+        }
+
+        let mut evicted = None;
+        {
+            let mut order = self.completed_order.lock().await;
+            order.push_back(message);
+            if order.len() > SEEN_COMPLETE_LIMIT {
+                evicted = order.pop_front();
+            }
+        }
+
+        if let Some(evicted_id) = evicted {
+            let mut complete = self.seen_complete.lock().await;
+            complete.remove(&evicted_id);
+        }
+    }
 }
 
 impl Deref for BroadcastNode {
@@ -78,7 +115,10 @@ impl HandleMessage for Broadcast {
         } = msg;
 
         let resp_msg_id = node.id_provider.id();
-        node.seen.lock().await.entry(message).or_insert(src.clone());
+        {
+            let mut seen = node.seen.lock().await;
+            seen.entry(message).or_insert(src.clone());
+        }
 
         let response = Message {
             src: dst,
@@ -126,9 +166,7 @@ impl HandleMessage for Read {
         } = msg;
 
         let resp_msg_id = node.id_provider.id();
-        let seen = node.seen.lock().await;
-        let mut messages: HashSet<u64> = seen.keys().copied().collect();
-        messages.extend(node.seen_complete.lock().await.iter().cloned());
+        let messages = node.snapshot_messages().await;
 
         let response = Message {
             src: dst,
@@ -184,9 +222,11 @@ impl HandleMessage for Topology {
             bail!("malformed topology msg");
         };
 
-        let mut neighbours_locked = node.neighbours.lock().await;
-        for neighbour in neighbours {
-            neighbours_locked.insert(neighbour);
+        {
+            let mut neighbours_locked = node.neighbours.lock().await;
+            for neighbour in neighbours {
+                neighbours_locked.insert(neighbour);
+            }
         }
 
         let response = Message {
@@ -235,10 +275,13 @@ impl HandleMessage for SendMin {
                 },
         } = msg;
 
-        let seen_complete = node.seen_complete.lock().await;
+        let seen_complete_snapshot = {
+            let complete = node.seen_complete.lock().await;
+            complete.clone()
+        };
         let mut seen_locked = node.seen.lock().await;
         for msg in messages {
-            if seen_complete.contains(&msg) {
+            if seen_complete_snapshot.contains(&msg) {
                 continue;
             }
             seen_locked.entry(msg).or_insert(src.clone());
@@ -271,10 +314,11 @@ trait HandleMessage: Sized {
 impl Node for BroadcastNode {
     type Payload = BroadcastNodePayload;
     type PayloadSupplied = SuppliedPayload;
+    type Service = ();
 
     async fn from_init(
         init: Init,
-        _kv: KvClient,
+        _services: (),
         id_provider: MsgIDProvider,
         tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
@@ -310,6 +354,7 @@ impl Node for BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {
                 node_id,
                 id_provider,
+                completed_order: Mutex::new(VecDeque::new()),
                 seen_complete: Mutex::new(HashSet::new()),
                 seen: Mutex::new(HashMap::new()),
                 neighbours: Mutex::new(HashSet::new()),
@@ -357,22 +402,29 @@ impl Node for BroadcastNode {
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Gossip = msg;
 
-        let mut complete_locked = self.seen_complete.lock().await;
-        let neighbours_locked = self.neighbours.lock().await;
-        let mut msgs_locked = self.seen.lock().await;
+        let neighbours_snapshot = {
+            let neighbours = self.neighbours.lock().await;
+            neighbours.clone()
+        };
+
+        let drained_msgs: Vec<(u64, String)> = {
+            let mut msgs = self.seen.lock().await;
+            msgs.drain().collect()
+        };
 
         let mut need_to_send: HashMap<String, HashSet<u64>> = HashMap::new();
 
-        for (msg, seen) in msgs_locked.drain() {
-            let mut unseen_by = neighbours_locked.clone();
-            unseen_by.remove(&seen);
-            for unseen_neighbour in unseen_by {
+        for (msg, seen_by) in drained_msgs {
+            for neighbour in neighbours_snapshot.iter() {
+                if neighbour == &seen_by {
+                    continue;
+                }
                 need_to_send
-                    .entry(unseen_neighbour)
+                    .entry(neighbour.clone())
                     .or_default()
                     .insert(msg);
             }
-            complete_locked.insert(msg);
+            self.record_completion(msg).await;
         }
 
         for (unseen_neighbour, messages) in need_to_send {
@@ -404,17 +456,7 @@ impl Node for BroadcastNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     main_loop::<BroadcastNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
-}
-
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let _ = fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
 }
