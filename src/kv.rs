@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,20 +70,48 @@ impl std::error::Error for KvError {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MsgIDProvider {
     inner: Arc<AtomicU64>,
+    hook: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+}
+
+impl fmt::Debug for MsgIDProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MsgIDProvider").finish()
+    }
+}
+
+impl Default for MsgIDProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MsgIDProvider {
     pub fn new() -> MsgIDProvider {
         MsgIDProvider {
             inner: Arc::new(AtomicU64::new(0)),
+            hook: None,
+        }
+    }
+
+    pub fn with_hook<F>(&self, hook: F) -> MsgIDProvider
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        MsgIDProvider {
+            inner: Arc::clone(&self.inner),
+            hook: Some(Arc::new(hook)),
         }
     }
 
     pub fn id(&self) -> u64 {
-        self.inner.fetch_add(1, Ordering::SeqCst)
+        let id = self.inner.fetch_add(1, Ordering::SeqCst);
+        if let Some(hook) = &self.hook {
+            hook(id);
+        }
+        id
     }
 }
 
@@ -100,10 +129,6 @@ pub type LwwKvClient = KvClient<LwwStore>;
 
 #[derive(Debug)]
 enum KVMsg {
-    ShouldProcess {
-        msg_id: u64,
-        tx: oneshot::Sender<bool>,
-    },
     Read {
         key: String,
         tx: oneshot::Sender<Result<u64, KvError>>,
@@ -184,15 +209,6 @@ impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
             tm,
             _marker: PhantomData,
         }
-    }
-
-    pub async fn should_process(&self, msg_id: u64) -> anyhow::Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(KVMsg::ShouldProcess { msg_id, tx })
-            .await
-            .context("failed to send msg")?;
-        rx.await.context("failed to receive")
     }
 
     pub async fn read(&self, key: impl AsRef<str>) -> Result<u64, KvError> {
@@ -322,15 +338,6 @@ async fn handle_message(
     tx_payload: &mut Sender<Message<Body<KvPayload>>>,
 ) -> anyhow::Result<()> {
     match msg {
-        KVMsg::ShouldProcess { msg_id, tx } => {
-            let res = waiting_for_read.contains_key(&msg_id)
-                || waiting_for_write.contains_key(&msg_id)
-                || waiting_for_cas.contains_key(&msg_id);
-            debug!(msg_id, res, "kv should_process check");
-            if let Err(err) = tx.send(res) {
-                warn!("should_process receiver dropped for msg_id {msg_id}: {err}");
-            }
-        }
         KVMsg::Read { key, tx } => {
             let msg_id = id_provider.id();
             waiting_for_read.insert(msg_id, tx);
@@ -504,6 +511,7 @@ async fn handle_message(
             }
         }
     }
+    
     Ok(())
 }
 
@@ -516,10 +524,6 @@ pub struct TsoClient {
 
 #[derive(Debug)]
 enum TsoMsg {
-    ShouldProcess {
-        msg_id: u64,
-        tx: oneshot::Sender<bool>,
-    },
     Ts {
         tx: oneshot::Sender<Result<u64, KvError>>,
     },
@@ -559,15 +563,6 @@ impl TsoClient {
             }
         });
         TsoClient { tx, cancel, tm }
-    }
-
-    pub async fn should_process(&self, msg_id: u64) -> anyhow::Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(TsoMsg::ShouldProcess { msg_id, tx })
-            .await
-            .context("failed to send msg")?;
-        rx.await.context("failed to receive")
     }
 
     pub async fn ts(&self) -> Result<u64, KvError> {
@@ -624,12 +619,6 @@ async fn handle_tso_message(
     tx_payload: &mut Sender<Message<Body<KvPayload>>>,
 ) -> anyhow::Result<()> {
     match msg {
-        TsoMsg::ShouldProcess { msg_id, tx } => {
-            let res = waiting_for_ts.contains_key(&msg_id);
-            if let Err(err) = tx.send(res) {
-                warn!("should_process receiver dropped for msg_id {msg_id}: {err}");
-            }
-        }
         TsoMsg::Ts { tx } => {
             let msg_id = id_provider.id();
             waiting_for_ts.insert(msg_id, tx);
@@ -693,7 +682,6 @@ pub enum KvPayload {
 
 fn kv_msg_label(msg: &KVMsg) -> &'static str {
     match msg {
-        KVMsg::ShouldProcess { .. } => "should_process",
         KVMsg::Read { .. } => "read",
         KVMsg::ReadResponse { .. } => "read_response",
         KVMsg::Write { .. } => "write",

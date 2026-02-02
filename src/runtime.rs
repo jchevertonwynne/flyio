@@ -2,10 +2,11 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::BufRead;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
@@ -17,19 +18,98 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::kv::{KvClient, KvPayload, MsgIDProvider, StoreName, TsoClient};
 use crate::message::{Body, Init, Message, MinBody, PayloadInit};
 
+#[derive(Clone)]
+pub(crate) struct RouteRegistry {
+    routes: Arc<Mutex<HashMap<u64, ServiceSlot>>>,
+}
+
+impl RouteRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            routes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn bind(&self, provider: &MsgIDProvider, slot: ServiceSlot) -> MsgIDProvider {
+        let routes = Arc::clone(&self.routes);
+        provider.with_hook(move |msg_id| {
+            let mut map = routes.lock().expect("route registry poisoned");
+            map.insert(msg_id, slot);
+        })
+    }
+
+    pub(crate) fn take(&self, msg_id: u64) -> Option<ServiceSlot> {
+        self.routes
+            .lock()
+            .expect("route registry poisoned")
+            .remove(&msg_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ServiceSlot {
+    depth: u8,
+    path: [u8; ServiceSlot::MAX_DEPTH],
+}
+
+impl ServiceSlot {
+    const MAX_DEPTH: usize = 8;
+
+    pub(crate) fn root() -> Self {
+        Self {
+            depth: 0,
+            path: [0; ServiceSlot::MAX_DEPTH],
+        }
+    }
+
+    pub(crate) fn child(&self, idx: u8) -> Self {
+        let mut next = *self;
+        debug_assert!(
+            (next.depth as usize) < Self::MAX_DEPTH,
+            "service route depth overflow"
+        );
+        if (next.depth as usize) == Self::MAX_DEPTH {
+            panic!("service route depth exceeded {}", Self::MAX_DEPTH);
+        }
+        next.path[next.depth as usize] = idx;
+        next.depth += 1;
+        next
+    }
+
+    pub(crate) fn split(mut self) -> Option<(u8, ServiceSlot)> {
+        if self.depth == 0 {
+            return None;
+        }
+        let head = self.path[0];
+        for i in 1..self.depth as usize {
+            self.path[i - 1] = self.path[i];
+        }
+        self.depth -= 1;
+        Some((head, self))
+    }
+}
+
 pub trait Service: Sized + Send + Sync + Clone + 'static {
     fn init(
         id_provider: MsgIDProvider,
         node_id: String,
         tx: Sender<Message<Body<KvPayload>>>,
+        routes: RouteRegistry,
+        slot: ServiceSlot,
     ) -> Self;
-
-    fn should_process(&self, reply_id: u64) -> impl Future<Output = anyhow::Result<bool>> + Send;
 
     fn process(
         &self,
         msg: Message<Body<KvPayload>>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn dispatch(
+        &self,
+        _slot: ServiceSlot,
+        msg: Message<Body<KvPayload>>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        self.process(msg)
+    }
 
     fn stop(&self) -> impl Future<Output = ()> + Send;
 }
@@ -39,11 +119,9 @@ impl Service for () {
         _id_provider: MsgIDProvider,
         _node_id: String,
         _tx: Sender<Message<Body<KvPayload>>>,
+        _routes: RouteRegistry,
+        _slot: ServiceSlot,
     ) -> Self {
-    }
-
-    async fn should_process(&self, _reply_id: u64) -> anyhow::Result<bool> {
-        Ok(false)
     }
 
     async fn process(&self, _msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
@@ -58,20 +136,19 @@ impl<S: StoreName + Send + Sync + Clone + 'static> Service for KvClient<S> {
         id_provider: MsgIDProvider,
         node_id: String,
         tx: Sender<Message<Body<KvPayload>>>,
+        routes: RouteRegistry,
+        slot: ServiceSlot,
     ) -> Self {
+        let id_provider = routes.bind(&id_provider, slot);
         KvClient::<S>::new(id_provider, node_id, tx)
     }
 
-    async fn should_process(&self, reply_id: u64) -> anyhow::Result<bool> {
-        self.should_process(reply_id).await
-    }
-
     async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
-        self.process(msg).await
+        KvClient::<S>::process(self, msg).await
     }
 
     async fn stop(&self) {
-        self.stop().await
+        KvClient::<S>::stop(self).await
     }
 }
 
@@ -80,81 +157,102 @@ impl Service for TsoClient {
         id_provider: MsgIDProvider,
         node_id: String,
         tx: Sender<Message<Body<KvPayload>>>,
+        routes: RouteRegistry,
+        slot: ServiceSlot,
     ) -> Self {
+        let id_provider = routes.bind(&id_provider, slot);
         TsoClient::new(id_provider, node_id, tx)
     }
 
-    async fn should_process(&self, reply_id: u64) -> anyhow::Result<bool> {
-        self.should_process(reply_id).await
-    }
-
     async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
-        self.process(msg).await
+        TsoClient::process(self, msg).await
     }
 
     async fn stop(&self) {
-        self.stop().await
+        TsoClient::stop(self).await
     }
 }
 
-impl<A: Service> Service for (A,) {
-    fn init(
-        id_provider: MsgIDProvider,
-        node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
-    ) -> Self {
-        (A::init(id_provider, node_id, tx),)
-    }
-
-    async fn should_process(&self, reply_id: u64) -> anyhow::Result<bool> {
-        self.0.should_process(reply_id).await
-    }
-
-    async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
-        self.0.process(msg).await
-    }
-
-    async fn stop(&self) {
-        self.0.stop().await
-    }
-}
-
-impl<A: Service, B: Service> Service for (A, B) {
-    fn init(
-        id_provider: MsgIDProvider,
-        node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
-    ) -> Self {
-        (
-            A::init(id_provider.clone(), node_id.clone(), tx.clone()),
-            B::init(id_provider, node_id, tx),
-        )
-    }
-
-    async fn should_process(&self, reply_id: u64) -> anyhow::Result<bool> {
-        if self.0.should_process(reply_id).await? {
-            return Ok(true);
+macro_rules! tuple_dispatch_chain {
+    ($idx_val:expr, $rest:expr, $msg:ident, $counter:expr, $head:expr $(, $tail:expr)*) => {
+        if $idx_val == $counter {
+            $head
+                .dispatch($rest, $msg.take().expect("tuple message already dispatched"))
+                .await
+        } else {
+            tuple_dispatch_chain!($idx_val, $rest, $msg, $counter + 1, $( $tail ),*)
         }
-        self.1.should_process(reply_id).await
-    }
+    };
+    ($idx_val:expr, $rest:expr, $msg:ident, $counter:expr,) => {
+        bail!("unknown service slot index {idx}", idx = $idx_val)
+    };
+}
 
-    async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
-        if let Some(reply_id) = msg.body.in_reply_to {
-            if self.0.should_process(reply_id).await? {
-                return self.0.process(msg).await;
+macro_rules! impl_service_for_tuple {
+    ( $( $name:ident ),+ ) => {
+        impl<$( $name: Service ),+> Service for ( $( $name, )+ ) {
+            fn init(
+                id_provider: MsgIDProvider,
+                node_id: String,
+                tx: Sender<Message<Body<KvPayload>>>,
+                routes: RouteRegistry,
+                slot: ServiceSlot,
+            ) -> Self {
+                let mut slot_idx: u8 = 0;
+                (
+                    $(
+                        {
+                            let current_idx = slot_idx;
+                            slot_idx += 1;
+                            let _ = slot_idx;
+                            let child_slot = slot.child(current_idx);
+                            $name::init(
+                                id_provider.clone(),
+                                node_id.clone(),
+                                tx.clone(),
+                                routes.clone(),
+                                child_slot,
+                            )
+                        },
+                    )+
+                )
             }
-            if self.1.should_process(reply_id).await? {
-                return self.1.process(msg).await;
+
+            async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
+                bail!("received unrouted service message: {msg:?}")
+            }
+
+            async fn dispatch(&self, slot: ServiceSlot, msg: Message<Body<KvPayload>>)
+                -> anyhow::Result<()>
+            {
+                let Some((idx, rest)) = slot.split() else {
+                    bail!("missing child slot while dispatching tuple service");
+                };
+                let ( $( casey::lower!($name), )+ ) = self;
+                let mut msg = Some(msg);
+                tuple_dispatch_chain!(
+                    idx,
+                    rest,
+                    msg,
+                    0,
+                    $( casey::lower!($name) ),+
+                )
+            }
+
+            async fn stop(&self) {
+                let ( $( casey::lower!($name), )+ ) = self;
+                $(
+                    casey::lower!($name).stop().await;
+                )+
             }
         }
-        bail!("neither service wanted to process message")
-    }
-
-    async fn stop(&self) {
-        self.0.stop().await;
-        self.1.stop().await;
-    }
+    };
 }
+
+impl_service_for_tuple!(A);
+impl_service_for_tuple!(A, B);
+impl_service_for_tuple!(A, B, C);
+impl_service_for_tuple!(A, B, C, D);
 
 pub trait Node: Clone + Sized + Send + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
@@ -167,16 +265,19 @@ pub trait Node: Clone + Sized + Send + 'static {
         id_provider: MsgIDProvider,
         rx: Sender<Self::PayloadSupplied>,
     ) -> impl Future<Output = anyhow::Result<Self>> + Send;
+
     fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     fn handle_supplied(
         &self,
         msg: Self::PayloadSupplied,
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     fn stop(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
@@ -185,6 +286,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut shutdown = std::pin::pin!(futures_lite::future::race(sigint.recv(), sigterm.recv()));
 
     let mut stdin = spawn_stdin();
 
@@ -192,14 +294,15 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     let (tx_kv, rx_kv) = channel::<Message<Body<KvPayload>>>(1);
     let (tx_init, rx_init) = channel::<Message<Body<PayloadInit>>>(1);
     let id_provider = MsgIDProvider::new();
+    let routes = RouteRegistry::new();
 
     let writer_handle = spawn_stdout_writer::<N>(rx_node, rx_kv, rx_init);
 
     let (node, mut rx_node_supplied, services, buffered) = select! {
-        _ = futures_lite::future::race(sigint.recv(), sigterm.recv()) => {
+        _ = &mut shutdown => {
             return Ok(())
         }
-        res = handle_init::<N>(&mut stdin, id_provider, tx_kv, tx_init) => {
+        res = handle_init::<N>(&mut stdin, id_provider, tx_kv, tx_init, routes.clone()) => {
             res?
         }
     };
@@ -207,7 +310,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     let mut set = JoinSet::new();
 
     for line in buffered {
-        if let Err(err) = process_line(line, &services, &node, &tx_node, &mut set).await {
+        if let Err(err) = process_line(line, &services, &node, &tx_node, &routes, &mut set).await {
             error!("failed to process buffered init message: {err}");
         }
     }
@@ -216,7 +319,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     loop {
         select! {
-            _ = futures_lite::future::race(sigint.recv(), sigterm.recv()) => {
+            _ = &mut shutdown => {
                 return Ok(())
             }
             line = stdin.recv() => {
@@ -226,7 +329,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                 };
                 let line = line.context("stdin recv returned error before JSON parsing")?;
 
-                if let Err(err) = process_line(line, &services, &node, &tx_node, &mut set).await {
+                 if let Err(err) = process_line(line, &services, &node, &tx_node, &routes, &mut set).await {
                      error!("failed to process inbound message: {err}");
                 }
             }
@@ -275,31 +378,13 @@ async fn process_line<N: Node>(
     services: &N::Service,
     node: &N,
     tx_node: &Sender<Message<Body<N::Payload>>>,
+    routes: &RouteRegistry,
     set: &mut JoinSet<()>,
 ) -> anyhow::Result<()> {
-    let msg: Message<&RawValue> = serde_json::from_str(line.as_str())
-        .with_context(|| format!("failed to parse inbound message envelope: {line}"))?;
-    let min_body: MinBody = serde_json::from_str(msg.body.get()).with_context(|| {
-        format!(
-            "failed to parse inbound minimal body from payload: {}",
-            msg.body.get()
-        )
-    })?;
-
-    if let Some(reply_id) = min_body.in_reply_to
-        && services.should_process(reply_id).await?
-    {
-        let (bdy, msg) = msg.extract_body();
-        let payload: Body<KvPayload> = serde_json::from_str(bdy.get())
-            .with_context(|| format!("failed to parse kv payload from raw body: {}", bdy.get()))?;
-        let (_, msg) = msg.replace_body(payload);
-        debug!("kv processing msg {msg:?}");
-        services
-            .process(msg)
-            .await
-            .context("kv failed to process msg")?;
+    let (msg, min_body) = parse_envelope(line.as_str())?;
+    let Some(msg) = handle_service_message(msg, &min_body, services, routes).await? else {
         return Ok(());
-    }
+    };
 
     let (bdy, msg) = msg.extract_body();
     let payload: Body<N::Payload> = serde_json::from_str(bdy.get())
@@ -325,6 +410,7 @@ async fn handle_init<N: Node>(
     id_provider: MsgIDProvider,
     tx_kv: Sender<Message<Body<KvPayload>>>,
     tx_init: Sender<Message<Body<PayloadInit>>>,
+    routes: RouteRegistry,
 ) -> Result<(N, Receiver<N::PayloadSupplied>, N::Service, Vec<String>), anyhow::Error> {
     let line = rx_stdin
         .recv()
@@ -345,7 +431,13 @@ async fn handle_init<N: Node>(
         bail!("should not receive an InitOk msg first")
     };
 
-    let services = N::Service::init(id_provider.clone(), init.node_id.clone(), tx_kv);
+    let services = N::Service::init(
+        id_provider.clone(),
+        init.node_id.clone(),
+        tx_kv,
+        routes.clone(),
+        ServiceSlot::root(),
+    );
 
     let (tx_supplied, rx_supplied) = channel(1);
 
@@ -370,30 +462,11 @@ async fn handle_init<N: Node>(
                 };
                 let line = line.context("stdin recv error during init")?;
 
-                let msg: Message<&RawValue> = serde_json::from_str(&line)
-                    .with_context(|| format!("failed to parse inbound message envelope: {line}"))?;
-                let min_body: MinBody = serde_json::from_str(msg.body.get()).with_context(|| {
-                    format!(
-                        "failed to parse inbound minimal body from payload: {}",
-                        msg.body.get()
-                    )
-                })?;
-
-                if let Some(reply_id) = min_body.in_reply_to
-                    && services_clone.should_process(reply_id).await?
+                let (msg, min_body) = parse_envelope(&line)?;
+                if handle_service_message(msg, &min_body, &services_clone, &routes)
+                    .await?
+                    .is_some()
                 {
-                    let (bdy, msg) = msg.extract_body();
-                    let payload: Body<KvPayload> =
-                        serde_json::from_str(bdy.get()).with_context(|| {
-                            format!("failed to parse kv payload from raw body: {}", bdy.get())
-                        })?;
-                    let (_, msg) = msg.replace_body(payload);
-                    debug!("kv processing msg {msg:?}");
-                    services_clone
-                        .process(msg)
-                        .await
-                        .context("kv failed to process msg")?;
-                } else {
                     warn!("buffering message during init: {line}");
                     buffered_lines.push(line);
                 }
@@ -447,6 +520,43 @@ fn spawn_stdout_writer<N: Node>(
             }
         }
     })
+}
+
+fn parse_envelope<'a>(line: &'a str) -> anyhow::Result<(Message<&'a RawValue>, MinBody)> {
+    let msg: Message<&'a RawValue> = serde_json::from_str(line)
+        .with_context(|| format!("failed to parse inbound message envelope: {line}"))?;
+    let min_body: MinBody = serde_json::from_str(msg.body.get()).with_context(|| {
+        format!(
+            "failed to parse inbound minimal body from payload: {}",
+            msg.body.get()
+        )
+    })?;
+    Ok((msg, min_body))
+}
+
+async fn handle_service_message<'a, S: Service>(
+    msg: Message<&'a RawValue>,
+    min_body: &MinBody,
+    services: &S,
+    routes: &RouteRegistry,
+) -> anyhow::Result<Option<Message<&'a RawValue>>> {
+    if let Some(reply_id) = min_body.in_reply_to {
+        if let Some(slot) = routes.take(reply_id) {
+            let (bdy, msg) = msg.extract_body();
+            let payload: Body<KvPayload> = serde_json::from_str(bdy.get()).with_context(|| {
+                format!("failed to parse kv payload from raw body: {}", bdy.get())
+            })?;
+            let (_, msg) = msg.replace_body(payload);
+            debug!("kv routing msg {msg:?} via slot {slot:?}");
+            services
+                .dispatch(slot, msg)
+                .await
+                .context("kv failed to process msg")?;
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(msg))
 }
 
 async fn handle_output<T: Serialize + Debug>(

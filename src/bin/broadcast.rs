@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use enum_dispatch::enum_dispatch;
 use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -35,12 +36,17 @@ const SEEN_COMPLETE_LIMIT: usize = 10_000;
 
 impl BroadcastNodeInner {
     async fn snapshot_messages(&self) -> HashSet<u64> {
-        let mut messages = {
+        let mut messages = HashSet::new();
+        {
             let complete = self.seen_complete.lock().await;
-            complete.clone()
-        };
-
-        messages.extend(self.seen.lock().await.keys().copied());
+            messages.reserve(complete.len());
+            messages.extend(complete.iter().copied());
+        }
+        {
+            let seen = self.seen.lock().await;
+            messages.reserve(seen.len());
+            messages.extend(seen.keys().copied());
+        }
         messages
     }
 
@@ -65,6 +71,64 @@ impl BroadcastNodeInner {
             let mut complete = self.seen_complete.lock().await;
             complete.remove(&evicted_id);
         }
+    }
+
+    async fn queue_pending_from<I>(&self, source: &str, messages: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut pending: Vec<u64> = messages.into_iter().collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        let filtered: Vec<u64> = {
+            let complete = self.seen_complete.lock().await;
+            pending.retain(|msg| !complete.contains(msg));
+            pending
+        };
+
+        if filtered.is_empty() {
+            return;
+        }
+
+        let mut seen_locked = self.seen.lock().await;
+        for msg in filtered {
+            seen_locked.entry(msg).or_insert_with(|| source.to_string());
+        }
+    }
+
+    async fn flush_pending(&self) -> HashMap<String, HashSet<u64>> {
+        let neighbours = {
+            let neighbours = self.neighbours.lock().await;
+            neighbours.clone()
+        };
+
+        let drained: Vec<(u64, String)> = {
+            let mut msgs = self.seen.lock().await;
+            msgs.drain().collect()
+        };
+
+        let grouped: HashMap<String, Vec<u64>> = drained
+            .into_iter()
+            .map(|(msg, seen_by)| (seen_by, msg))
+            .into_group_map();
+
+        let mut need_to_send: HashMap<String, HashSet<u64>> = HashMap::new();
+
+        for (seen_by, msgs) in grouped {
+            for neighbour in neighbours.iter().filter(|n| *n != &seen_by) {
+                need_to_send
+                    .entry(neighbour.clone())
+                    .or_default()
+                    .extend(msgs.iter().copied());
+            }
+            for msg in msgs {
+                self.record_completion(msg).await;
+            }
+        }
+
+        need_to_send
     }
 }
 
@@ -115,10 +179,7 @@ impl HandleMessage for Broadcast {
         } = msg;
 
         let resp_msg_id = node.id_provider.id();
-        {
-            let mut seen = node.seen.lock().await;
-            seen.entry(message).or_insert(src.clone());
-        }
+        node.queue_pending_from(&src, [message]).await;
 
         let response = Message {
             src: dst,
@@ -275,17 +336,7 @@ impl HandleMessage for SendMin {
                 },
         } = msg;
 
-        let seen_complete_snapshot = {
-            let complete = node.seen_complete.lock().await;
-            complete.clone()
-        };
-        let mut seen_locked = node.seen.lock().await;
-        for msg in messages {
-            if seen_complete_snapshot.contains(&msg) {
-                continue;
-            }
-            seen_locked.entry(msg).or_insert(src.clone());
-        }
+        node.queue_pending_from(&src, messages).await;
 
         Ok(())
     }
@@ -402,32 +453,9 @@ impl Node for BroadcastNode {
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Gossip = msg;
 
-        let neighbours_snapshot = {
-            let neighbours = self.neighbours.lock().await;
-            neighbours.clone()
-        };
+        let plan = self.flush_pending().await;
 
-        let drained_msgs: Vec<(u64, String)> = {
-            let mut msgs = self.seen.lock().await;
-            msgs.drain().collect()
-        };
-
-        let mut need_to_send: HashMap<String, HashSet<u64>> = HashMap::new();
-
-        for (msg, seen_by) in drained_msgs {
-            for neighbour in neighbours_snapshot.iter() {
-                if neighbour == &seen_by {
-                    continue;
-                }
-                need_to_send
-                    .entry(neighbour.clone())
-                    .or_default()
-                    .insert(msg);
-            }
-            self.record_completion(msg).await;
-        }
-
-        for (unseen_neighbour, messages) in need_to_send {
+        for (unseen_neighbour, messages) in plan {
             let msg_id = self.id_provider.id();
             tx.send(Message {
                 src: self.node_id.clone(),
