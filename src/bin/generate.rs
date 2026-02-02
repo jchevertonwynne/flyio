@@ -121,5 +121,6 @@ fn init_tracing() {
     let _ = fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .try_init();
 }

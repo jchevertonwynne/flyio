@@ -47,18 +47,48 @@ impl GrowNodeInner {
     }
 
     async fn ensure_counter_exists(&self) -> anyhow::Result<()> {
-        let mut sleep_dur = Duration::from_millis(1);
         loop {
             match self.kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
                 Ok(_) => return Ok(()),
-                Err(err) => {
-                    warn!(?err, "failed to ensure shared counter exists");
+                Err(_) => {}
+            }
+        }
+    }
+
+    async fn flush_pending(&self) -> anyhow::Result<()> {
+        let pending = self.propogate.swap(0, Ordering::SeqCst);
+        if pending == 0 {
+            return Ok(());
+        }
+
+        self.ensure_counter_ready().await?;
+        let mut sleep_duration = Duration::from_millis(1);
+        loop {
+            let value = self.kv.read(COUNTER_KEY).await?;
+            let new_value = value
+                .checked_add(pending)
+                .context("shared counter would overflow u64")?;
+
+            match self
+                .kv
+                .compare_and_swap(COUNTER_KEY, value, new_value, false)
+                .await?
+            {
+                true => {
+                    debug!(value, new_value, pending, "flushed pending delta");
+                    break;
+                }
+                false => {
+                    debug!(value, new_value, pending, "flush contention; retrying");
+                    tokio::time::sleep(sleep_duration).await;
+                    sleep_duration = sleep_duration
+                        .saturating_mul(2)
+                        .min(Duration::from_millis(100));
                 }
             }
-
-            tokio::time::sleep(sleep_dur).await;
-            sleep_dur = sleep_dur.saturating_mul(2).min(Duration::from_millis(100));
         }
+
+        Ok(())
     }
 }
 
@@ -154,28 +184,11 @@ impl HandleMessage for Read {
                 },
         } = msg;
 
-        node.ensure_counter_ready().await?;
-        let mut sleep_duration = Duration::from_millis(1);
-
-        let value = loop {
-            let value = node.kv.read(COUNTER_KEY).await?;
-            match node
-                .kv
-                .compare_and_swap(COUNTER_KEY, value, value, false)
-                .await?
-            {
-                true => {
-                    debug!(value, "successful read of shared counter");
-                    break value;
-                }
-                false => {
-                    debug!(value, "retrying read of shared counter after contention");
-                    tokio::time::sleep(sleep_duration).await;
-                    sleep_duration = sleep_duration
-                        .saturating_mul(2)
-                        .min(Duration::from_millis(100));
-                }
-            }
+        node.flush_pending().await?;
+        let value = match node.kv.read(COUNTER_KEY).await {
+            Ok(v) => v,
+            Err(flyio::KvError::KeyDoesNotExist) => 0,
+            Err(e) => return Err(e.into()),
         };
 
         let resp_msg_id = node.id_provider.id();
@@ -311,41 +324,9 @@ impl Node for GrowNode {
     ) -> anyhow::Result<()> {
         let SuppliedPayload::Tick = msg;
 
-        let pending = self.propogate.load(Ordering::SeqCst);
-        if pending > 0 {
-            self.ensure_counter_ready().await?;
-            debug!(pending, "flushing shared counter");
-            let mut value;
-            let mut sleep_duration = Duration::from_millis(1);
-            loop {
-                value = self.kv.read(COUNTER_KEY).await?;
-                let new_value = value + pending;
-                match self
-                    .kv
-                    .compare_and_swap(COUNTER_KEY, value, new_value, false)
-                    .await?
-                {
-                    true => {
-                        debug!(value, new_value, "flushed shared counter successfully");
-                        self.propogate.store(0, Ordering::SeqCst);
-                        break;
-                    }
-                    false => {
-                        debug!(
-                            value,
-                            "contention detected during flush of shared counter, sleeping for {sleep_duration:?}"
-                        );
-                        tokio::time::sleep(sleep_duration).await;
-                        sleep_duration = sleep_duration
-                            .saturating_mul(2)
-                            .min(Duration::from_millis(100));
-                        continue;
-                    }
-                }
-            }
+        if self.propogate.load(Ordering::SeqCst) > 0 {
+            self.flush_pending().await?;
         }
-
-        self.kv.compare_and_swap("other key", 0, 0, true).await?;
 
         Ok(())
     }
@@ -364,6 +345,7 @@ fn init_tracing() {
     let _ = fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .try_init();
 }
 

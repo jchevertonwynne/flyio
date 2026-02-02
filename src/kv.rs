@@ -12,6 +12,34 @@ use tracing::{debug, error, warn};
 
 use crate::message::{Body, Message};
 
+#[derive(Debug)]
+pub enum KvError {
+    KeyDoesNotExist,
+    PreconditionFailed,
+    Other { code: u16, text: String },
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for KvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KvError::KeyDoesNotExist => write!(f, "key does not exist"),
+            KvError::PreconditionFailed => write!(f, "precondition failed"),
+            KvError::Other { code, text } => write!(f, "kv error code {code}: {text}"),
+            KvError::Internal(err) => write!(f, "kv internal error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for KvError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            KvError::Internal(err) => Some(err.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MsgIDProvider {
     inner: Arc<AtomicU64>,
@@ -36,6 +64,7 @@ pub struct KvClient {
     tm: TaskTracker,
 }
 
+#[derive(Debug)]
 enum KVMsg {
     ShouldProcess {
         msg_id: u64,
@@ -43,7 +72,7 @@ enum KVMsg {
     },
     Read {
         key: String,
-        tx: oneshot::Sender<anyhow::Result<u64>>,
+        tx: oneshot::Sender<Result<u64, KvError>>,
     },
     ReadResponse {
         msg_id: u64,
@@ -52,7 +81,7 @@ enum KVMsg {
     Write {
         key: String,
         value: u64,
-        tx: oneshot::Sender<anyhow::Result<()>>,
+        tx: oneshot::Sender<Result<(), KvError>>,
     },
     WriteResponse {
         msg_id: u64,
@@ -62,7 +91,7 @@ enum KVMsg {
         from: u64,
         to: u64,
         create_if_not_exists: bool,
-        tx: oneshot::Sender<anyhow::Result<bool>>,
+        tx: oneshot::Sender<Result<bool, KvError>>,
     },
     CmpAndSwpResponse {
         msg_id: u64,
@@ -88,11 +117,11 @@ impl KvClient {
             let cancel = cancel.clone();
             async move {
                 let mut waiting_for_read =
-                    HashMap::<u64, oneshot::Sender<anyhow::Result<u64>>>::new();
+                    HashMap::<u64, oneshot::Sender<Result<u64, KvError>>>::new();
                 let mut waiting_for_write =
-                    HashMap::<u64, oneshot::Sender<anyhow::Result<()>>>::new();
+                    HashMap::<u64, oneshot::Sender<Result<(), KvError>>>::new();
                 let mut waiting_for_cas =
-                    HashMap::<u64, oneshot::Sender<anyhow::Result<bool>>>::new();
+                    HashMap::<u64, oneshot::Sender<Result<bool, KvError>>>::new();
                 loop {
                     select! {
                         _ = cancel.cancelled() => break,
@@ -127,24 +156,30 @@ impl KvClient {
         rx.await.context("failed to receive")
     }
 
-    pub async fn read(&self, key: impl AsRef<str>) -> anyhow::Result<u64> {
+    pub async fn read(&self, key: impl AsRef<str>) -> Result<u64, KvError> {
         let key = key.as_ref().to_string();
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(KVMsg::Read { key, tx })
             .await
-            .context("failed to send msg")?;
-        rx.await.context("failed to receive")?
+            .context("failed to send read msg")
+            .map_err(KvError::Internal)?;
+        rx.await
+            .context("failed to receive read response")
+            .map_err(KvError::Internal)?
     }
 
-    pub async fn write(&self, key: impl AsRef<str>, value: u64) -> anyhow::Result<()> {
+    pub async fn write(&self, key: impl AsRef<str>, value: u64) -> Result<(), KvError> {
         let key = key.as_ref().to_string();
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(KVMsg::Write { key, value, tx })
             .await
-            .context("failed to send msg")?;
-        rx.await.context("failed to receive")?
+            .context("failed to send write msg")
+            .map_err(KvError::Internal)?;
+        rx.await
+            .context("failed to receive write response")
+            .map_err(KvError::Internal)?
     }
 
     pub async fn compare_and_swap(
@@ -153,7 +188,7 @@ impl KvClient {
         from: u64,
         to: u64,
         create_if_not_exists: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, KvError> {
         let key = key.as_ref().to_string();
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -165,8 +200,11 @@ impl KvClient {
                 tx,
             })
             .await
-            .context("failed to send msg")?;
-        rx.await.context("failed to receive")?
+            .context("failed to send cas msg")
+            .map_err(KvError::Internal)?;
+        rx.await
+            .context("failed to receive cas response")
+            .map_err(KvError::Internal)?
     }
 
     pub async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
@@ -238,9 +276,9 @@ async fn handle_message(
     msg: KVMsg,
     node_id: &String,
     id_provider: &MsgIDProvider,
-    waiting_for_read: &mut HashMap<u64, oneshot::Sender<anyhow::Result<u64>>>,
-    waiting_for_write: &mut HashMap<u64, oneshot::Sender<anyhow::Result<()>>>,
-    waiting_for_cas: &mut HashMap<u64, oneshot::Sender<anyhow::Result<bool>>>,
+    waiting_for_read: &mut HashMap<u64, oneshot::Sender<Result<u64, KvError>>>,
+    waiting_for_write: &mut HashMap<u64, oneshot::Sender<Result<(), KvError>>>,
+    waiting_for_cas: &mut HashMap<u64, oneshot::Sender<Result<bool, KvError>>>,
     tx_payload: &mut Sender<Message<Body<KvPayload>>>,
 ) -> anyhow::Result<()> {
     match msg {
@@ -366,9 +404,17 @@ async fn handle_message(
             }
         }
         KVMsg::ErrorResponse { msg_id, code, text } => {
-            let err_msg = format!("kv error code {code}: {text}");
+            let mk_error = |t: &str| match code {
+                20 => KvError::KeyDoesNotExist,
+                22 => KvError::PreconditionFailed,
+                _ => KvError::Other {
+                    code,
+                    text: t.to_string(),
+                },
+            };
+
             if let Some(tx) = waiting_for_read.remove(&msg_id) {
-                if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
+                if let Err(err) = tx.send(Err(mk_error(&text))) {
                     warn!("failed to deliver read error for msg_id {msg_id}: {err:?}");
                 }
                 debug!(
@@ -378,7 +424,7 @@ async fn handle_message(
                     "kv delivered read error"
                 );
             } else if let Some(tx) = waiting_for_write.remove(&msg_id) {
-                if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
+                if let Err(err) = tx.send(Err(mk_error(&text))) {
                     warn!("failed to deliver write error for msg_id {msg_id}: {err:?}");
                 }
                 debug!(
@@ -398,7 +444,7 @@ async fn handle_message(
                         code,
                         "kv delivered cas mismatch"
                     );
-                } else if let Err(err) = tx.send(Err(Error::msg(err_msg.clone()))) {
+                } else if let Err(err) = tx.send(Err(mk_error(&text))) {
                     warn!("failed to deliver cas error for msg_id {msg_id}: {err:?}");
                 } else {
                     debug!(
@@ -413,7 +459,7 @@ async fn handle_message(
                     waiting_reads = waiting_for_read.len(),
                     waiting_writes = waiting_for_write.len(),
                     waiting_cas = waiting_for_cas.len(),
-                    "received kv error response for unknown msg_id {msg_id}: {err_msg}"
+                    "received kv error response for unknown msg_id {msg_id}: code={code} text={text}"
                 );
             }
         }
