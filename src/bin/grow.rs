@@ -10,11 +10,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    select,
-    sync::{OnceCell, mpsc::Sender},
-    time::MissedTickBehavior,
-};
+use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -32,36 +28,15 @@ struct GrowNodeInner {
     kv: KvClient,
     tasks: TaskTracker,
     cancel: CancellationToken,
-    counter_ready: OnceCell<()>,
 }
 
 impl GrowNodeInner {
-    async fn ensure_counter_ready(&self) -> anyhow::Result<()> {
-        self.counter_ready
-            .get_or_try_init(|| async {
-                self.ensure_counter_exists().await?;
-                Ok(())
-            })
-            .await
-            .map(|_| ())
-    }
-
-    async fn ensure_counter_exists(&self) -> anyhow::Result<()> {
-        loop {
-            match self.kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
-                Ok(_) => return Ok(()),
-                Err(_) => {}
-            }
-        }
-    }
-
     async fn flush_pending(&self) -> anyhow::Result<()> {
         let pending = self.propogate.swap(0, Ordering::SeqCst);
         if pending == 0 {
             return Ok(());
         }
 
-        self.ensure_counter_ready().await?;
         let mut sleep_duration = Duration::from_millis(1);
         loop {
             let value = self.kv.read(COUNTER_KEY).await?;
@@ -268,6 +243,13 @@ impl Node for GrowNode {
         id_provider: MsgIDProvider,
         tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
+        loop {
+            match kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
+                Ok(_) => break,
+                Err(_) => {}
+            }
+        }
+
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
@@ -300,7 +282,6 @@ impl Node for GrowNode {
                 kv,
                 tasks: tracker,
                 cancel,
-                counter_ready: OnceCell::new(),
             }),
         })
     }

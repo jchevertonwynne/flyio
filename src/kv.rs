@@ -1,4 +1,4 @@
-use anyhow::{Context, Error, bail};
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

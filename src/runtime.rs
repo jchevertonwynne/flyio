@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use futures_lite::future::race;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
@@ -47,24 +48,13 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     let (tx_node, mut rx_node) = channel::<Message<Body<N::Payload>>>(1);
     let (tx_kv, mut rx_kv) = channel(1);
+    let (tx_init, mut rx_init) = channel::<Message<Body<PayloadInit>>>(1);
     let id_provider = MsgIDProvider::new();
 
-    let (node, mut rx_node_supplied, kv) = select! {
-        _ = sigint.recv() => {
-            return Ok(())
-        }
-        _ = sigterm.recv() => {
-            return Ok(())
-        }
-        res = handle_init::<N>(&mut stdout, id_provider, &mut stdin, tx_kv) => {
-            let (node, rx_node, kv) = res?;
-            (node, rx_node, kv)
-        }
-    };
-
-    let handle = tokio::spawn(async move {
+    let writer_handle = tokio::spawn(async move {
         let mut node_running = true;
         let mut kv_running = true;
+        let mut init_running = true;
         loop {
             select! {
                 msg = rx_node.recv(), if node_running => {
@@ -115,12 +105,49 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                         }
                     }
                 },
+                msg = rx_init.recv(), if init_running => {
+                    let msg = match msg {
+                        Some(msg) => msg,
+                        None => {
+                            init_running = false;
+                            continue;
+                        }
+                    };
+                    debug!("sending init msg {msg:?}");
+                    match serde_json::to_string(&msg) {
+                        Ok(mut outbound) => {
+                            outbound.push('\n');
+
+                            if let Err(err) = stdout.write_all(outbound.as_bytes()).await {
+                                error!("failed to write init msg to stdout: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            error!(
+                                "failed to serialize outbound init msg {msg:?} before writing: {err}"
+                            );
+                        }
+                    }
+                },
                 else => {
                     break;
                 }
             }
         }
     });
+
+    let (node, mut rx_node_supplied, kv) = select! {
+        _ = sigint.recv() => {
+            return Ok(())
+        }
+        _ = sigterm.recv() => {
+            return Ok(())
+        }
+        res = handle_init::<N>(&mut stdin, id_provider, tx_kv, tx_init) => {
+            let (node, rx_node, kv) = res?;
+            (node, rx_node, kv)
+        }
+    };
 
     let mut set = JoinSet::new();
 
@@ -201,7 +228,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     drop(tx_node);
     info!("about to wait for writer task");
-    handle.await.context("writer task panicked")?;
+    writer_handle.await.context("writer task panicked")?;
     info!("about to wait for node");
     node.stop().await.context("failed to stop node")?;
     kv.stop().await;
@@ -211,10 +238,10 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 }
 
 async fn handle_init<N: Node>(
-    stdout: &mut tokio::io::Stdout,
-    id_provider: MsgIDProvider,
     rx_stdin: &mut Receiver<anyhow::Result<String>>,
+    id_provider: MsgIDProvider,
     tx_kv: Sender<Message<Body<KvPayload>>>,
+    tx_init: Sender<Message<Body<PayloadInit>>>,
 ) -> Result<(N, Receiver<N::PayloadSupplied>, KvClient), anyhow::Error> {
     let line = rx_stdin
         .recv()
@@ -238,9 +265,54 @@ async fn handle_init<N: Node>(
     let kv = KvClient::new(id_provider.clone(), init.node_id.clone(), tx_kv);
 
     let (tx_supplied, rx_supplied) = channel(1);
-    let node = N::from_init(init, kv.clone(), id_provider, tx_supplied)
-        .await
-        .context("failed to build node")?;
+
+    let init_fut = async {
+        N::from_init(init, kv.clone(), id_provider, tx_supplied)
+            .await
+            .context("failed to build node")
+    };
+
+    let kv_clone = kv.clone();
+    let stdin_fut = async {
+        loop {
+            let Some(line) = rx_stdin.recv().await else {
+                bail!("stdin closed");
+            };
+            let line = line.context("stdin recv error")?;
+
+            let msg: Message<&RawValue> = serde_json::from_str(&line)
+                .with_context(|| format!("failed to parse inbound message envelope: {line}"))?;
+            let min_body: MinBody = serde_json::from_str(msg.body.get()).with_context(|| {
+                format!(
+                    "failed to parse inbound minimal body from payload: {}",
+                    msg.body.get()
+                )
+            })?;
+
+            if let Some(reply_id) = min_body.in_reply_to
+                && kv_clone.should_process(reply_id).await?
+            {
+                let (bdy, msg) = msg.extract_body();
+                let payload: Body<KvPayload> =
+                    serde_json::from_str(bdy.get()).with_context(|| {
+                        format!("failed to parse kv payload from raw body: {}", bdy.get())
+                    })?;
+                let (_, msg) = msg.replace_body(payload);
+                debug!("kv processing msg {msg:?}");
+                kv_clone
+                    .process(msg)
+                    .await
+                    .context("kv failed to process msg")?;
+            } else {
+                warn!("ignoring non-kv message during init: {line}");
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Ok::<N, anyhow::Error>(unreachable!())
+    };
+
+    let node = race(init_fut, stdin_fut).await?;
 
     let response = Message {
         src: dst,
@@ -252,12 +324,10 @@ async fn handle_init<N: Node>(
         },
     };
 
-    let mut resp = serde_json::to_string(&response).context("failed to marshal json response")?;
-    resp.push('\n');
-    stdout
-        .write(resp.as_bytes())
+    tx_init
+        .send(response)
         .await
-        .context("failed to write to stdout")?;
+        .context("failed to send init response")?;
 
     Ok((node, rx_supplied, kv))
 }
