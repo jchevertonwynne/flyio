@@ -163,7 +163,7 @@ pub trait Node: Clone + Sized + Send + 'static {
 
     fn from_init(
         init: Init,
-        services: Self::Service,
+        service: Self::Service,
         id_provider: MsgIDProvider,
         rx: Sender<Self::PayloadSupplied>,
     ) -> impl Future<Output = anyhow::Result<Self>> + Send;
