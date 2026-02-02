@@ -23,6 +23,7 @@ struct GrowNode {
 }
 
 struct GrowNodeInner {
+    node_id: String,
     id_provider: MsgIDProvider,
     propogate: AtomicU64,
     kv: KvClient,
@@ -160,6 +161,15 @@ impl HandleMessage for Read {
         } = msg;
 
         node.flush_pending().await?;
+
+        let sync_key = format!("sync-{}", node.node_id);
+        let sync_val = node.id_provider.id();
+
+        node.kv
+            .write(sync_key, sync_val)
+            .await
+            .context("failed to write sync key")?;
+
         let value = match node.kv.read(COUNTER_KEY).await {
             Ok(v) => v,
             Err(flyio::KvError::KeyDoesNotExist) => 0,
@@ -238,7 +248,7 @@ impl Node for GrowNode {
     type PayloadSupplied = SuppliedPayload;
 
     async fn from_init(
-        _init: Init,
+        init: Init,
         kv: KvClient,
         id_provider: MsgIDProvider,
         tx: Sender<Self::PayloadSupplied>,
@@ -277,6 +287,7 @@ impl Node for GrowNode {
 
         Ok(GrowNode {
             inner: Arc::new(GrowNodeInner {
+                node_id: init.node_id,
                 id_provider,
                 propogate: AtomicU64::new(0),
                 kv,
