@@ -1,13 +1,15 @@
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
-use std::convert::Infallible;
 use std::fmt::Debug;
-use std::future::Future;
+use std::time::Duration;
 use tokio::select;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
+use tokio::time::{interval, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::kv::{KvPayload, MsgIDProvider};
@@ -16,86 +18,105 @@ use crate::message::{Body, Init, Message, MinBody, PayloadInit};
 use super::routes::{RouteRegistry, ServiceSlot};
 use super::service::Service;
 
-pub trait SimpleNode: Clone + Sized + Send + 'static {
+#[async_trait]
+pub trait SimpleNode: Clone + Sized + Send + Sync + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
 
-    fn from_init_simple(
+    async fn from_init_simple(
         init: Init,
         id_provider: MsgIDProvider,
-    ) -> impl Future<Output = anyhow::Result<Self>> + Send;
+    ) -> anyhow::Result<Self>;
 
-    fn handle_simple(
+    async fn handle_simple(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> anyhow::Result<()>;
 
-    fn stop_simple(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
+    async fn stop_simple(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    async fn handle_tick_simple(
+        &self,
+        _tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-pub trait Node: Clone + Sized + Send + 'static {
+#[async_trait]
+pub trait Node: Clone + Sized + Send + Sync + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
-    type PayloadSupplied: Debug + Send + 'static;
     type Service: Service;
 
-    fn from_init(
+    async fn from_init(
         init: Init,
         service: Self::Service,
         id_provider: MsgIDProvider,
-        rx: Sender<Self::PayloadSupplied>,
-    ) -> impl Future<Output = anyhow::Result<Self>> + Send;
+    ) -> anyhow::Result<Self>;
 
-    fn handle(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> anyhow::Result<()>;
 
-    fn handle_supplied(
+    async fn stop(&self) -> anyhow::Result<()>;
+
+    fn tick_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    async fn handle_tick(
         &self,
-        msg: Self::PayloadSupplied,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
-
-    fn stop(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
+        _tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
+#[async_trait]
 impl<T> Node for T
 where
     T: SimpleNode,
 {
     type Payload = T::Payload;
-    type PayloadSupplied = Infallible;
     type Service = ();
 
-    fn from_init(
+    async fn from_init(
         init: Init,
         _service: Self::Service,
         id_provider: MsgIDProvider,
-        _tx: Sender<Self::PayloadSupplied>,
-    ) -> impl Future<Output = anyhow::Result<Self>> + Send {
-        T::from_init_simple(init, id_provider)
+    ) -> anyhow::Result<Self> {
+        T::from_init_simple(init, id_provider).await
     }
 
-    fn handle(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send {
-        T::handle_simple(self, msg, tx)
+    ) -> anyhow::Result<()> {
+        T::handle_simple(self, msg, tx).await
     }
 
-    #[allow(clippy::manual_async_fn)]
-    fn handle_supplied(
+    async fn stop(&self) -> anyhow::Result<()> {
+        T::stop_simple(self).await
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        T::tick_interval(self)
+    }
+
+    async fn handle_tick(
         &self,
-        msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send {
-        async move { match msg {} }
-    }
-
-    fn stop(&self) -> impl Future<Output = anyhow::Result<()>> + Send {
-        T::stop_simple(self)
+        tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> anyhow::Result<()> {
+        T::handle_tick_simple(self, tx).await
     }
 }
 
@@ -137,25 +158,13 @@ pub(crate) async fn handle_node_message<N: Node>(
     }
 }
 
-pub(crate) async fn handle_node_supplied_message<N: Node>(
-    supplied: N::PayloadSupplied,
-    node: N,
-    tx: Sender<Message<Body<N::Payload>>>,
-) {
-    debug!("handling supplied msg {supplied:?}");
-    let resp = node.handle_supplied(supplied, tx).await;
-    if let Err(err) = resp {
-        error!("node handle supplied failed: {err}");
-    }
-}
-
 pub(crate) async fn handle_init<N: Node>(
     rx_stdin: &mut Receiver<anyhow::Result<String>>,
     id_provider: MsgIDProvider,
     tx_kv: Sender<Message<Body<KvPayload>>>,
     tx_init: Sender<Message<Body<PayloadInit>>>,
     routes: RouteRegistry,
-) -> Result<(N, Receiver<N::PayloadSupplied>, N::Service, Vec<String>), anyhow::Error> {
+) -> Result<(N, N::Service, Vec<String>), anyhow::Error> {
     let line = rx_stdin
         .recv()
         .await
@@ -183,11 +192,9 @@ pub(crate) async fn handle_init<N: Node>(
         ServiceSlot::root(),
     );
 
-    let (tx_supplied, rx_supplied) = channel(1);
-
     let services_init = services.clone();
     let mut init_node_fut = std::pin::pin!(async move {
-        N::from_init(init, services_init, id_provider, tx_supplied)
+        N::from_init(init, services_init, id_provider)
             .await
             .context("failed to build node")
     });
@@ -233,7 +240,7 @@ pub(crate) async fn handle_init<N: Node>(
         .await
         .context("failed to send init response")?;
 
-    Ok((node, rx_supplied, services, buffered_lines))
+    Ok((node, services, buffered_lines))
 }
 
 pub(crate) async fn handle_service_message<'a, S: Service>(
@@ -270,4 +277,29 @@ fn parse_envelope<'a>(line: &'a str) -> anyhow::Result<(Message<&'a RawValue>, M
         )
     })?;
     Ok((msg, min_body))
+}
+
+pub(crate) async fn run_node_ticks<N: Node>(
+    node: N,
+    tx: Sender<Message<Body<N::Payload>>>,
+    cancel: CancellationToken,
+    period: Duration,
+) {
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        select! {
+            () = cancel.cancelled() => {
+                debug!("tick loop shutting down");
+                break;
+            }
+            _ = ticker.tick() => {
+                debug!("dispatching node tick");
+                if let Err(err) = node.handle_tick(tx.clone()).await {
+                    error!("node tick failed: {err}");
+                }
+            }
+        }
+    }
 }

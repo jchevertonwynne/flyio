@@ -1,11 +1,10 @@
 use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
+use async_trait::async_trait;
 use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
-use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
 #[derive(Clone)]
@@ -18,8 +17,6 @@ struct KafkaNodeInner {
     node_id: String,
     #[allow(dead_code)]
     id_provider: MsgIDProvider,
-    cancel: CancellationToken,
-    tasks: TaskTracker,
 
     kv: LinKvClient,
 }
@@ -47,7 +44,6 @@ impl Deref for Kafka {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[enum_dispatch(HandleMessage)]
 enum KafkaNodePayload {
     Send(Send),
     SendOk(SendOk),
@@ -67,7 +63,7 @@ struct Send {
     msg: u64,
 }
 
-impl HandleMessage for Send {
+impl Send {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -146,7 +142,18 @@ struct SendOk {
     offset: u64,
 }
 
-impl HandleMessage for SendOk {}
+impl SendOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &Kafka,
+        _tx: Sender<Message<Body<KafkaNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected SendOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,7 +161,7 @@ struct Poll {
     offsets: HashMap<String, u64>,
 }
 
-impl HandleMessage for Poll {
+impl Poll {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -241,7 +248,18 @@ impl<'de> Deserialize<'de> for PollOkMessageEntry {
     }
 }
 
-impl HandleMessage for PollOk {}
+impl PollOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &Kafka,
+        _tx: Sender<Message<Body<KafkaNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected PollOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,7 +267,7 @@ struct CommitOffsets {
     offsets: HashMap<String, u64>,
 }
 
-impl HandleMessage for CommitOffsets {
+impl CommitOffsets {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -318,7 +336,18 @@ impl HandleMessage for CommitOffsets {
 #[serde(rename_all = "snake_case")]
 struct CommitOffsetsOk;
 
-impl HandleMessage for CommitOffsetsOk {}
+impl CommitOffsetsOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &Kafka,
+        _tx: Sender<Message<Body<KafkaNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected CommitOffsetsOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -326,7 +355,7 @@ struct ListCommittedOffsets {
     keys: Vec<String>,
 }
 
-impl HandleMessage for ListCommittedOffsets {
+impl ListCommittedOffsets {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -378,7 +407,18 @@ struct ListCommittedOffsetsOk {
     offsets: HashMap<String, u64>,
 }
 
-impl HandleMessage for ListCommittedOffsetsOk {}
+impl ListCommittedOffsetsOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &Kafka,
+        _tx: Sender<Message<Body<KafkaNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected ListCommittedOffsetsOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -387,7 +427,8 @@ struct Error {
     text: String,
 }
 
-impl HandleMessage for Error {
+impl Error {
+    #[allow(clippy::unused_async)]
     async fn handle(
         self,
         _msg: Message<Body<()>>,
@@ -401,66 +442,43 @@ impl HandleMessage for Error {
     }
 }
 
-#[derive(Debug)]
-enum SuppliedPayload {
-    Tick,
-}
-
-#[enum_dispatch]
-trait HandleMessage: Sized {
-    async fn handle(
+impl KafkaNodePayload {
+    async fn dispatch(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
         tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        _ = msg;
-        _ = node;
-        _ = tx;
-        bail!("unexpected msg type")
-    }
-}
-
-async fn ticker_loop(cancel: CancellationToken, tx: Sender<SuppliedPayload>) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        select! {
-            _ = ticker.tick() => {
-                tx.send(SuppliedPayload::Tick)
-                    .await
-                    .context("failed to send msg")?;
+        match self {
+            KafkaNodePayload::Send(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::SendOk(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::Poll(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::PollOk(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::CommitOffsets(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::CommitOffsetsOk(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::ListCommittedOffsets(payload) => payload.handle(msg, node, tx).await,
+            KafkaNodePayload::ListCommittedOffsetsOk(payload) => {
+                payload.handle(msg, node, tx).await
             }
-            () = cancel.cancelled() => {
-                return Ok(())
-            }
+            KafkaNodePayload::Error(payload) => payload.handle(msg, node, tx).await,
         }
     }
 }
 
+#[async_trait]
 impl Node for Kafka {
     type Payload = KafkaNodePayload;
-    type PayloadSupplied = SuppliedPayload;
     type Service = LinKvClient;
 
     async fn from_init(
         init: Init,
         lin_kv: LinKvClient,
         id_provider: MsgIDProvider,
-        tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
-        let cancel = CancellationToken::new();
-        let tracker = TaskTracker::new();
-
-        tracker.spawn(ticker_loop(cancel.clone(), tx.clone()));
-
         Ok(Kafka {
             inner: Arc::new(KafkaNodeInner {
                 node_id: init.node_id,
                 id_provider,
-                cancel,
-                tasks: tracker,
                 kv: lin_kv,
             }),
         })
@@ -472,27 +490,10 @@ impl Node for Kafka {
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let (payload, message) = msg.replace_payload(());
-
-        payload.handle(message, self, tx).await?;
-
-        Ok(())
-    }
-
-    async fn handle_supplied(
-        &self,
-        msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        let SuppliedPayload::Tick = msg;
-
-        Ok(())
+        payload.dispatch(message, self, tx).await
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        self.cancel.cancel();
-        self.tasks.close();
-        self.tasks.wait().await;
-
         Ok(())
     }
 }

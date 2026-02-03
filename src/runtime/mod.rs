@@ -19,8 +19,9 @@ use crate::kv::{KvPayload, MsgIDProvider};
 use crate::message::{Body, Message, PayloadInit};
 
 use io::{spawn_stdin, stdout_writer_loop};
-use node::{handle_init, handle_node_supplied_message, process_line};
+use node::{handle_init, process_line, run_node_ticks};
 use routes::RouteRegistry;
+use tokio_util::sync::CancellationToken;
 
 /// Runs the main event loop for a node.
 ///
@@ -48,7 +49,7 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     let writer_handle = tokio::spawn(stdout_writer_loop::<N>(rx_node, rx_kv, rx_init));
 
-    let (node, mut rx_node_supplied, services, buffered) = select! {
+    let (node, services, buffered) = select! {
         _ = &mut shutdown => {
             return Ok(())
         }
@@ -59,13 +60,19 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
 
     let mut set = JoinSet::new();
 
+    let tick_cancel = CancellationToken::new();
+    if let Some(period) = node.tick_interval() {
+        let node_clone = node.clone();
+        let tx_clone = tx_node.clone();
+        let cancel = tick_cancel.clone();
+        set.spawn(run_node_ticks(node_clone, tx_clone, cancel, period));
+    }
+
     for line in buffered {
         if let Err(err) = process_line(line, &services, &node, &tx_node, &routes, &mut set).await {
             error!("failed to process buffered init message: {err}");
         }
     }
-
-    let mut supplied_open = true;
 
     loop {
         select! {
@@ -83,23 +90,11 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
                      error!("failed to process inbound message: {err}");
                 }
             }
-            supplied = rx_node_supplied.recv(), if supplied_open => {
-                let Some(supplied) = supplied else {
-                    supplied_open = false;
-                    warn!("supplied channel closed");
-                    continue
-                };
-
-                let tx = tx_node.clone();
-                let node = node.clone();
-
-                set.spawn(handle_node_supplied_message(supplied, node, tx));
-
-            }
         }
     }
 
     drop(tx_node);
+    tick_cancel.cancel();
 
     while let Some(result) = set.join_next().await {
         if let Err(err) = result {

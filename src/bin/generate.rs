@@ -1,6 +1,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
@@ -31,75 +32,65 @@ enum GeneratePayload {
     GenerateOk { id: String },
 }
 
+#[async_trait]
 impl SimpleNode for GenerateNode {
     type Payload = GeneratePayload;
 
-    #[allow(clippy::manual_async_fn)]
-    fn from_init_simple(
+    async fn from_init_simple(
         init: Init,
         id_provider: MsgIDProvider,
-    ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
-        async move {
-            let Init {
-                node_id,
-                node_ids: _,
-            } = init;
+    ) -> anyhow::Result<Self> {
+        let Init {
+            node_id,
+            node_ids: _,
+        } = init;
 
-            Ok(GenerateNode {
-                inner: Arc::new(GenerateNodeInner {
-                    node_id,
-                    id_provider,
-                }),
-            })
-        }
+        Ok(GenerateNode {
+            inner: Arc::new(GenerateNodeInner {
+                node_id,
+                id_provider,
+            }),
+        })
     }
 
-    #[allow(clippy::manual_async_fn)]
-    fn handle_simple(
+    async fn handle_simple(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-        async move {
-            let Message {
-                src,
-                dst,
-                body:
-                    Body {
-                        incoming_msg_id: id,
-                        in_reply_to: _,
-                        payload,
-                    },
-            } = msg;
+    ) -> anyhow::Result<()> {
+        let Message {
+            src,
+            dst,
+            body:
+                Body {
+                    incoming_msg_id: id,
+                    in_reply_to: _,
+                    payload,
+                },
+        } = msg;
 
-            match payload {
-                GeneratePayload::Generate => {
-                    let resp_msg_id = self.id_provider.id();
+        match payload {
+            GeneratePayload::Generate => {
+                let resp_msg_id = self.id_provider.id();
 
-                    let response = Message {
-                        src: dst,
-                        dst: src,
-                        body: Body {
-                            incoming_msg_id: Some(resp_msg_id),
-                            in_reply_to: id,
-                            payload: GeneratePayload::GenerateOk {
-                                id: format!("{}-{}", self.node_id, resp_msg_id),
-                            },
+                let response = Message {
+                    src: dst,
+                    dst: src,
+                    body: Body {
+                        incoming_msg_id: Some(resp_msg_id),
+                        in_reply_to: id,
+                        payload: GeneratePayload::GenerateOk {
+                            id: format!("{}-{}", self.node_id, resp_msg_id),
                         },
-                    };
+                    },
+                };
 
-                    tx.send(response).await.context("channel closed")?;
-                }
-                GeneratePayload::GenerateOk { .. } => bail!("i should not receive this"),
+                tx.send(response).await.context("channel closed")?;
             }
-
-            Ok(())
+            GeneratePayload::GenerateOk { .. } => bail!("i should not receive this"),
         }
-    }
 
-    #[allow(clippy::manual_async_fn)]
-    fn stop_simple(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-        async { Ok(()) }
+        Ok(())
     }
 }
 

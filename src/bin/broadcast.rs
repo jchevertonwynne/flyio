@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use async_trait::async_trait;
+use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,11 +9,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    select,
-    sync::{Mutex, mpsc::Sender},
-};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::sync::{Mutex, mpsc::Sender};
 use tracing::error;
 
 #[derive(Clone)]
@@ -28,8 +24,6 @@ struct BroadcastNodeInner {
     completed_order: Mutex<VecDeque<u64>>,
     seen: Mutex<HashMap<u64, String>>,
     neighbours: Mutex<HashSet<String>>,
-    tasks: TaskTracker,
-    cancel: CancellationToken,
 }
 
 const SEEN_COMPLETE_LIMIT: usize = 10_000;
@@ -142,7 +136,6 @@ impl Deref for BroadcastNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[enum_dispatch(HandleMessage)]
 enum BroadcastNodePayload {
     Broadcast(Broadcast),
     BroadcastOk(BroadcastOk),
@@ -159,7 +152,7 @@ struct Broadcast {
     message: u64,
 }
 
-impl HandleMessage for Broadcast {
+impl Broadcast {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -201,13 +194,24 @@ impl HandleMessage for Broadcast {
 #[serde(rename_all = "snake_case")]
 struct BroadcastOk;
 
-impl HandleMessage for BroadcastOk {}
+impl BroadcastOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &BroadcastNode,
+        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected BroadcastOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct Read;
 
-impl HandleMessage for Read {
+impl Read {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -251,7 +255,18 @@ struct ReadOk {
     messages: HashSet<u64>,
 }
 
-impl HandleMessage for ReadOk {}
+impl ReadOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &BroadcastNode,
+        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected ReadOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -259,7 +274,7 @@ struct Topology {
     topology: HashMap<String, HashSet<String>>,
 }
 
-impl HandleMessage for Topology {
+impl Topology {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -309,7 +324,18 @@ impl HandleMessage for Topology {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TopologyOk;
-impl HandleMessage for TopologyOk {}
+impl TopologyOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &BroadcastNode,
+        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected TopologyOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -317,7 +343,7 @@ struct SendMin {
     messages: HashSet<u64>,
 }
 
-impl HandleMessage for SendMin {
+impl SendMin {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -341,66 +367,34 @@ impl HandleMessage for SendMin {
         Ok(())
     }
 }
-
-#[derive(Debug)]
-enum SuppliedPayload {
-    Gossip,
-}
-
-#[enum_dispatch]
-trait HandleMessage: Sized {
-    async fn handle(
+impl BroadcastNodePayload {
+    async fn dispatch(
         self,
         msg: Message<Body<()>>,
         node: &BroadcastNode,
         tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
-        _ = msg;
-        _ = node;
-        _ = tx;
-        bail!("unexpected msg type")
-    }
-}
-
-async fn gossip_ticker_loop(
-    cancel: CancellationToken,
-    tx: Sender<SuppliedPayload>,
-) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    loop {
-        select! {
-            _ = ticker.tick() => {
-                tx.send(SuppliedPayload::Gossip)
-                    .await
-                    .context("failed to send msg")?;
-            }
-            () = cancel.cancelled() => {
-                return Ok(())
-            }
+        match self {
+            BroadcastNodePayload::Broadcast(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::BroadcastOk(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::ReadOk(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::Topology(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::TopologyOk(payload) => payload.handle(msg, node, tx).await,
+            BroadcastNodePayload::SendMin(payload) => payload.handle(msg, node, tx).await,
         }
     }
 }
 
-impl Node for BroadcastNode {
+#[async_trait]
+impl SimpleNode for BroadcastNode {
     type Payload = BroadcastNodePayload;
-    type PayloadSupplied = SuppliedPayload;
-    type Service = ();
 
-    async fn from_init(
-        init: Init,
-        _services: (),
-        id_provider: MsgIDProvider,
-        tx: Sender<Self::PayloadSupplied>,
-    ) -> anyhow::Result<Self> {
+    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,
         } = init;
-
-        let cancel = CancellationToken::new();
-        let tracker = TaskTracker::new();
-
-        tracker.spawn(gossip_ticker_loop(cancel.clone(), tx.clone()));
 
         Ok(BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {
@@ -410,13 +404,11 @@ impl Node for BroadcastNode {
                 seen_complete: Mutex::new(HashSet::new()),
                 seen: Mutex::new(HashMap::new()),
                 neighbours: Mutex::new(HashSet::new()),
-                tasks: tracker,
-                cancel,
             }),
         })
     }
 
-    async fn handle(
+    async fn handle_simple(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
@@ -442,18 +434,17 @@ impl Node for BroadcastNode {
             },
         };
 
-        payload.handle(msg, self, tx).await?;
-
-        Ok(())
+        payload.dispatch(msg, self, tx).await
     }
 
-    async fn handle_supplied(
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
+    }
+
+    async fn handle_tick_simple(
         &self,
-        msg: Self::PayloadSupplied,
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
-        let SuppliedPayload::Gossip = msg;
-
         let plan = self.flush_pending().await;
 
         for (unseen_neighbour, messages) in plan {
@@ -470,14 +461,6 @@ impl Node for BroadcastNode {
             .await
             .context("failed to send supplied msg")?;
         }
-
-        Ok(())
-    }
-
-    async fn stop(&self) -> anyhow::Result<()> {
-        self.cancel.cancel();
-        self.tasks.close();
-        self.tasks.wait().await;
 
         Ok(())
     }

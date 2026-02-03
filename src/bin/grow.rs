@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
+use async_trait::async_trait;
 use flyio::{Body, Init, Message, MsgIDProvider, Node, SeqKvClient, main_loop};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,8 +10,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, warn};
 
 const COUNTER_KEY: &str = "shared_counter";
@@ -26,8 +25,6 @@ struct GrowNodeInner {
     id_provider: MsgIDProvider,
     propogate: AtomicU64,
     kv: SeqKvClient,
-    tasks: TaskTracker,
-    cancel: CancellationToken,
 }
 
 impl GrowNodeInner {
@@ -74,7 +71,6 @@ impl Deref for GrowNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[enum_dispatch(HandleMessage)]
 enum GrowNodePayload {
     Add(Add),
     AddOk(AddOk),
@@ -89,7 +85,7 @@ struct Add {
     delta: u64,
 }
 
-impl HandleMessage for Add {
+impl Add {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -132,13 +128,24 @@ impl HandleMessage for Add {
 #[serde(rename_all = "snake_case")]
 struct AddOk;
 
-impl HandleMessage for AddOk {}
+impl AddOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &GrowNode,
+        _tx: Sender<Message<Body<GrowNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected AddOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct Read;
 
-impl HandleMessage for Read {
+impl Read {
     async fn handle(
         self,
         msg: Message<Body<()>>,
@@ -196,7 +203,18 @@ struct ReadOk {
     value: u64,
 }
 
-impl HandleMessage for ReadOk {}
+impl ReadOk {
+    #[allow(clippy::unused_async)]
+    async fn handle(
+        self,
+        _msg: Message<Body<()>>,
+        _node: &GrowNode,
+        _tx: Sender<Message<Body<GrowNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let _ = self;
+        bail!("unexpected ReadOk message")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,7 +223,8 @@ struct Error {
     text: String,
 }
 
-impl HandleMessage for Error {
+impl Error {
+    #[allow(clippy::unused_async)]
     async fn handle(
         self,
         _msg: Message<Body<()>>,
@@ -219,54 +238,32 @@ impl HandleMessage for Error {
     }
 }
 
-#[derive(Debug)]
-enum SuppliedPayload {
-    Tick,
-}
-
-#[enum_dispatch]
-trait HandleMessage: Sized {
-    async fn handle(
+impl GrowNodePayload {
+    async fn dispatch(
         self,
         msg: Message<Body<()>>,
         node: &GrowNode,
         tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
-        _ = msg;
-        _ = node;
-        _ = tx;
-        bail!("unexpected msg type")
-    }
-}
-
-async fn ticker_loop(cancel: CancellationToken, tx: Sender<SuppliedPayload>) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        select! {
-            _ = ticker.tick() => {
-                tx.send(SuppliedPayload::Tick)
-                    .await
-                    .context("failed to send msg")?;
-            }
-            () = cancel.cancelled() => {
-                return Ok(())
-            }
+        match self {
+            GrowNodePayload::Add(payload) => payload.handle(msg, node, tx).await,
+            GrowNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
+            GrowNodePayload::Error(payload) => payload.handle(msg, node, tx).await,
+            GrowNodePayload::AddOk(payload) => payload.handle(msg, node, tx).await,
+            GrowNodePayload::ReadOk(payload) => payload.handle(msg, node, tx).await,
         }
     }
 }
 
+#[async_trait]
 impl Node for GrowNode {
     type Payload = GrowNodePayload;
-    type PayloadSupplied = SuppliedPayload;
     type Service = SeqKvClient;
 
     async fn from_init(
         init: Init,
         kv: SeqKvClient,
         id_provider: MsgIDProvider,
-        tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
         loop {
             match kv.compare_and_swap(COUNTER_KEY, 0, 0, true).await {
@@ -275,20 +272,12 @@ impl Node for GrowNode {
                 Err(e) => return Err(e).context("failed to init counter"),
             }
         }
-
-        let cancel = CancellationToken::new();
-        let tracker = TaskTracker::new();
-
-        tracker.spawn(ticker_loop(cancel.clone(), tx.clone()));
-
         Ok(GrowNode {
             inner: Arc::new(GrowNodeInner {
                 node_id: init.node_id,
                 id_provider,
                 propogate: AtomicU64::new(0),
                 kv,
-                tasks: tracker,
-                cancel,
             }),
         })
     }
@@ -299,31 +288,21 @@ impl Node for GrowNode {
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()> {
         let (payload, message) = msg.replace_payload(());
-
-        payload.handle(message, self, tx).await?;
-
-        Ok(())
+        payload.dispatch(message, self, tx).await
     }
 
-    async fn handle_supplied(
-        &self,
-        msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        let SuppliedPayload::Tick = msg;
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
+    }
 
+    async fn handle_tick(&self, _tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
         if self.propogate.load(Ordering::SeqCst) > 0 {
             self.flush_pending().await?;
         }
-
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        self.cancel.cancel();
-        self.tasks.close();
-        self.tasks.wait().await;
-
         Ok(())
     }
 }
