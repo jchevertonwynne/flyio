@@ -3,9 +3,9 @@ mod node;
 mod routes;
 mod service;
 
-pub use node::Node;
-pub use service::Service;
+pub use node::{Node, SimpleNode};
 pub use routes::ServiceSlot;
+pub use service::Service;
 
 use anyhow::Context;
 use tokio::select;

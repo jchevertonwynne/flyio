@@ -1,7 +1,6 @@
 use anyhow::{Context, bail};
-use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use tokio::sync::mpsc::Sender;
 use tracing::error;
 
@@ -17,63 +16,56 @@ enum EchoPayload {
     EchoOk { echo: String },
 }
 
-impl Node for EchoNode {
+impl SimpleNode for EchoNode {
     type Payload = EchoPayload;
-    type PayloadSupplied = Infallible;
-    type Service = ();
 
-    async fn from_init(
+    #[allow(clippy::manual_async_fn)]
+    fn from_init_simple(
         _init: Init,
-        _services: (),
         id_provider: MsgIDProvider,
-        _tx: Sender<Self::PayloadSupplied>,
-    ) -> anyhow::Result<Self> {
-        Ok(EchoNode { id_provider })
+    ) -> impl std::future::Future<Output = anyhow::Result<Self>> + Send {
+        async move { Ok(EchoNode { id_provider }) }
     }
 
-    async fn handle(
+    #[allow(clippy::manual_async_fn)]
+    fn handle_simple(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        let Message { src, dst, body } = msg;
-        let Body {
-            incoming_msg_id: id,
-            in_reply_to: _,
-            payload,
-        } = body;
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async move {
+            let Message { src, dst, body } = msg;
+            let Body {
+                incoming_msg_id: id,
+                in_reply_to: _,
+                payload,
+            } = body;
 
-        match payload {
-            EchoPayload::Echo { echo } => {
-                let resp_msg_id = self.id_provider.id();
-                let response = Message {
-                    src: dst,
-                    dst: src,
-                    body: Body {
-                        incoming_msg_id: Some(resp_msg_id),
-                        in_reply_to: id,
-                        payload: EchoPayload::EchoOk { echo },
-                    },
-                };
+            match payload {
+                EchoPayload::Echo { echo } => {
+                    let resp_msg_id = self.id_provider.id();
+                    let response = Message {
+                        src: dst,
+                        dst: src,
+                        body: Body {
+                            incoming_msg_id: Some(resp_msg_id),
+                            in_reply_to: id,
+                            payload: EchoPayload::EchoOk { echo },
+                        },
+                    };
 
-                tx.send(response).await.context("channel closed")?;
+                    tx.send(response).await.context("channel closed")?;
+                }
+                EchoPayload::EchoOk { echo: _ } => bail!("i should not receive this"),
             }
-            EchoPayload::EchoOk { echo: _ } => bail!("i should not receive this"),
+
+            Ok(())
         }
-
-        Ok(())
     }
 
-    async fn handle_supplied(
-        &self,
-        _msg: Self::PayloadSupplied,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        bail!("this should never receive supplied events")
-    }
-
-    async fn stop(&self) -> anyhow::Result<()> {
-        Ok(())
+    #[allow(clippy::manual_async_fn)]
+    fn stop_simple(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
     }
 }
 

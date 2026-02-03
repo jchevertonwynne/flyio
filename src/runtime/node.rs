@@ -2,6 +2,7 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
+use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::Future;
 use tokio::select;
@@ -14,6 +15,23 @@ use crate::message::{Body, Init, Message, MinBody, PayloadInit};
 
 use super::routes::{RouteRegistry, ServiceSlot};
 use super::service::Service;
+
+pub trait SimpleNode: Clone + Sized + Send + 'static {
+    type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
+
+    fn from_init_simple(
+        init: Init,
+        id_provider: MsgIDProvider,
+    ) -> impl Future<Output = anyhow::Result<Self>> + Send;
+
+    fn handle_simple(
+        &self,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn stop_simple(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
 
 pub trait Node: Clone + Sized + Send + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
@@ -40,6 +58,45 @@ pub trait Node: Clone + Sized + Send + 'static {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     fn stop(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+impl<T> Node for T
+where
+    T: SimpleNode,
+{
+    type Payload = T::Payload;
+    type PayloadSupplied = Infallible;
+    type Service = ();
+
+    fn from_init(
+        init: Init,
+        _service: Self::Service,
+        id_provider: MsgIDProvider,
+        _tx: Sender<Self::PayloadSupplied>,
+    ) -> impl Future<Output = anyhow::Result<Self>> + Send {
+        T::from_init_simple(init, id_provider)
+    }
+
+    fn handle(
+        &self,
+        msg: Message<Body<Self::Payload>>,
+        tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        T::handle_simple(self, msg, tx)
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn handle_supplied(
+        &self,
+        msg: Self::PayloadSupplied,
+        _tx: Sender<Message<Body<Self::Payload>>>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async move { match msg {} }
+    }
+
+    fn stop(&self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        T::stop_simple(self)
+    }
 }
 
 pub(crate) async fn process_line<N: Node>(
