@@ -1,14 +1,10 @@
 use anyhow::{Context, bail};
 use enum_dispatch::enum_dispatch;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
-use tokio::{
-    select,
-    sync::{Mutex, mpsc::Sender},
-    time::MissedTickBehavior,
-};
+use tokio::{select, sync::mpsc::Sender, time::MissedTickBehavior};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, warn};
 
@@ -25,17 +21,17 @@ struct KafkaNodeInner {
     cancel: CancellationToken,
     tasks: TaskTracker,
 
-    messages: Mutex<HashMap<String, MessageDetails>>,
+    kv: LinKvClient,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct MessageDetails {
     committed_offset: u64,
     next_offset: u64,
     messages: Vec<MessageEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageEntry {
     offset: u64,
     msg: u64,
@@ -82,16 +78,50 @@ impl HandleMessage for Send {
         let Body {
             incoming_msg_id,
             in_reply_to: _,
-            payload: _,
+            payload: (),
         } = body;
         let Self { key, msg } = self;
 
-        let mut msgs = node.messages.lock().await;
-        let entry = msgs.entry(key).or_default();
+        let kv_key = format!("kafka:{key}");
+        let (mut remote, mut create): (MessageDetails, bool) =
+            match node.kv.read(kv_key.clone()).await {
+                Ok(data) => (data, false),
+                Err(KvError::KeyDoesNotExist) => (MessageDetails::default(), true),
+                Err(e) => return Err(e.into()),
+            };
 
-        let offset = entry.next_offset;
-        entry.next_offset += 1;
-        entry.messages.push(MessageEntry { offset, msg });
+        let mut sleep_dur = Duration::from_millis(1);
+        let offset = loop {
+            let mut entry = remote.clone();
+
+            let offset = entry.next_offset;
+            entry.next_offset += 1;
+            entry.messages.push(MessageEntry { offset, msg });
+
+            match node
+                .kv
+                .compare_and_swap(kv_key.clone(), &remote, &entry, create)
+                .await
+            {
+                Ok(true) => break offset,
+                Ok(false) => {
+                    create = false;
+                    remote = match node.kv.read(kv_key.clone()).await {
+                        Ok(data) => data,
+                        Err(KvError::KeyDoesNotExist) => MessageDetails::default(),
+                        Err(e) => return Err(e.into()),
+                    };
+                }
+                Err(KvError::KeyDoesNotExist) => {
+                    remote = MessageDetails::default();
+                    create = true;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            tokio::time::sleep(sleep_dur).await;
+            sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
+        };
 
         let resp_msg_id = node.id_provider.id();
         let response = Message {
@@ -105,6 +135,7 @@ impl HandleMessage for Send {
         };
 
         tx.send(response).await.context("channel closed")?;
+
         Ok(())
     }
 }
@@ -134,27 +165,29 @@ impl HandleMessage for Poll {
         let Body {
             incoming_msg_id,
             in_reply_to: _,
-            payload: _,
+            payload: (),
         } = body;
         let Self { offsets } = self;
         let mut result = HashMap::new();
-        let msgs = node.messages.lock().await;
 
         for (key, offset) in offsets {
-            if let Some(entries) = msgs.get(&key) {
-                let filtered: Vec<PollOkMessageEntry> = entries
-                    .messages
-                    .iter()
-                    .cloned()
-                    .filter(|entry| entry.offset >= offset)
-                    .map(|entry| PollOkMessageEntry {
-                        offset: entry.offset,
-                        msg: entry.msg,
-                    })
-                    .collect();
-                if !filtered.is_empty() {
-                    result.insert(key, filtered);
+            match node.kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                Ok(details) => {
+                    let filtered: Vec<PollOkMessageEntry> = details
+                        .messages
+                        .iter()
+                        .filter(|&entry| entry.offset >= offset)
+                        .map(|entry| PollOkMessageEntry {
+                            offset: entry.offset,
+                            msg: entry.msg,
+                        })
+                        .collect();
+                    if !filtered.is_empty() {
+                        result.insert(key, filtered);
+                    }
                 }
+                Err(KvError::KeyDoesNotExist) => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -227,14 +260,42 @@ impl HandleMessage for CommitOffsets {
         let Body {
             incoming_msg_id,
             in_reply_to: _,
-            payload: _,
+            payload: (),
         } = body;
         let Self { offsets } = self;
 
-        let mut msgs = node.messages.lock().await;
         for (key, offset) in offsets {
-            let entry = msgs.entry(key).or_default();
-            entry.committed_offset = entry.committed_offset.max(offset);
+            let key = format!("kafka:{key}");
+            let mut entry = match node.kv.read::<MessageDetails>(key.clone()).await {
+                Ok(entry) => entry,
+                Err(KvError::KeyDoesNotExist) => continue,
+                Err(e) => return Err(e.into()),
+            };
+
+            let mut sleep_dur = Duration::from_millis(1);
+            'cas: loop {
+                let mut entry_copy = entry.clone();
+                entry_copy.committed_offset = entry_copy.committed_offset.max(offset);
+
+                match node
+                    .kv
+                    .compare_and_swap(key.clone(), &entry, &entry_copy, false)
+                    .await
+                {
+                    Ok(true) | Err(KvError::KeyDoesNotExist) => break 'cas,
+                    Ok(false) => {
+                        entry = match node.kv.read(key.clone()).await {
+                            Ok(next) => next,
+                            Err(KvError::KeyDoesNotExist) => break 'cas,
+                            Err(e) => return Err(e.into()),
+                        };
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                tokio::time::sleep(sleep_dur).await;
+                sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
+            }
         }
 
         let resp_msg_id = node.id_provider.id();
@@ -276,15 +337,20 @@ impl HandleMessage for ListCommittedOffsets {
         let Body {
             incoming_msg_id,
             in_reply_to: _,
-            payload: _,
+            payload: (),
         } = body;
         let Self { keys } = self;
 
         let mut result = HashMap::new();
-        let msgs = node.messages.lock().await;
         for key in keys {
-            if let Some(entry) = msgs.get(&key) {
-                result.insert(key, entry.committed_offset);
+            match node.kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                Ok(val) => {
+                    result.insert(key, val.committed_offset);
+                }
+                Err(KvError::KeyDoesNotExist) => {
+                    result.insert(key, 0);
+                }
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -355,41 +421,39 @@ trait HandleMessage: Sized {
     }
 }
 
+async fn ticker_loop(cancel: CancellationToken, tx: Sender<SuppliedPayload>) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        select! {
+            _ = ticker.tick() => {
+                tx.send(SuppliedPayload::Tick)
+                    .await
+                    .context("failed to send msg")?;
+            }
+            () = cancel.cancelled() => {
+                return Ok(())
+            }
+        }
+    }
+}
+
 impl Node for Kafka {
     type Payload = KafkaNodePayload;
     type PayloadSupplied = SuppliedPayload;
-    type Service = ();
+    type Service = LinKvClient;
 
     async fn from_init(
         init: Init,
-        _service: (),
+        lin_kv: LinKvClient,
         id_provider: MsgIDProvider,
         tx: Sender<Self::PayloadSupplied>,
     ) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
-        tracker.spawn({
-            let cancel = cancel.clone();
-            async move {
-                let mut ticker = tokio::time::interval(Duration::from_millis(100));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-                loop {
-                    select! {
-                        _ = ticker.tick() => {
-                            tx.send(SuppliedPayload::Tick)
-                                .await
-                                .context("failed to send msg")?;
-
-                        }
-                        _ = cancel.cancelled() => {
-                            return Ok::<_, anyhow::Error>(())
-                        }
-                    }
-                }
-            }
-        });
+        tracker.spawn(ticker_loop(cancel.clone(), tx.clone()));
 
         Ok(Kafka {
             inner: Arc::new(KafkaNodeInner {
@@ -397,7 +461,7 @@ impl Node for Kafka {
                 id_provider,
                 cancel,
                 tasks: tracker,
-                messages: Mutex::new(HashMap::new()),
+                kv: lin_kv,
             }),
         })
     }

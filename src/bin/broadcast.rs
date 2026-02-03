@@ -174,7 +174,7 @@ impl HandleMessage for Broadcast {
                 Body {
                     incoming_msg_id,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -222,7 +222,7 @@ impl HandleMessage for Read {
                 Body {
                     incoming_msg_id,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -274,7 +274,7 @@ impl HandleMessage for Topology {
                 Body {
                     incoming_msg_id,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -332,7 +332,7 @@ impl HandleMessage for SendMin {
                 Body {
                     incoming_msg_id: _,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -362,6 +362,25 @@ trait HandleMessage: Sized {
     }
 }
 
+async fn gossip_ticker_loop(
+    cancel: CancellationToken,
+    tx: Sender<SuppliedPayload>,
+) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        select! {
+            _ = ticker.tick() => {
+                tx.send(SuppliedPayload::Gossip)
+                    .await
+                    .context("failed to send msg")?;
+            }
+            () = cancel.cancelled() => {
+                return Ok(())
+            }
+        }
+    }
+}
+
 impl Node for BroadcastNode {
     type Payload = BroadcastNodePayload;
     type PayloadSupplied = SuppliedPayload;
@@ -381,25 +400,7 @@ impl Node for BroadcastNode {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
-        tracker.spawn({
-            let cancel = cancel.clone();
-            async move {
-                let mut ticker = tokio::time::interval(Duration::from_millis(100));
-                loop {
-                    select! {
-                        _ = ticker.tick() => {
-                            tx.send(SuppliedPayload::Gossip)
-                                .await
-                                .context("failed to send msg")?;
-
-                        }
-                        _ = cancel.cancelled() => {
-                            return Ok::<_, anyhow::Error>(())
-                        }
-                    }
-                }
-            }
-        });
+        tracker.spawn(gossip_ticker_loop(cancel.clone(), tx.clone()));
 
         Ok(BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {

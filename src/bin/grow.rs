@@ -39,28 +39,25 @@ impl GrowNodeInner {
 
         let mut sleep_duration = Duration::from_millis(1);
         loop {
-            let value = self.kv.read(COUNTER_KEY).await?;
+            let value: u64 = self.kv.read(COUNTER_KEY).await?;
             let new_value = value
                 .checked_add(pending)
                 .context("shared counter would overflow u64")?;
 
-            match self
+            if self
                 .kv
                 .compare_and_swap(COUNTER_KEY, value, new_value, false)
                 .await?
             {
-                true => {
-                    debug!(value, new_value, pending, "flushed pending delta");
-                    break;
-                }
-                false => {
-                    debug!(value, new_value, pending, "flush contention; retrying");
-                    tokio::time::sleep(sleep_duration).await;
-                    sleep_duration = sleep_duration
-                        .saturating_mul(2)
-                        .min(Duration::from_millis(100));
-                }
+                debug!(value, new_value, pending, "flushed pending delta");
+                break;
             }
+
+            debug!(value, new_value, pending, "flush contention; retrying");
+            tokio::time::sleep(sleep_duration).await;
+            sleep_duration = sleep_duration
+                .saturating_mul(2)
+                .min(Duration::from_millis(100));
         }
 
         Ok(())
@@ -107,7 +104,7 @@ impl HandleMessage for Add {
                 Body {
                     incoming_msg_id,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -155,7 +152,7 @@ impl HandleMessage for Read {
                 Body {
                     incoming_msg_id,
                     in_reply_to: _,
-                    payload: _,
+                    payload: (),
                 },
         } = msg;
 
@@ -242,6 +239,24 @@ trait HandleMessage: Sized {
     }
 }
 
+async fn ticker_loop(cancel: CancellationToken, tx: Sender<SuppliedPayload>) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        select! {
+            _ = ticker.tick() => {
+                tx.send(SuppliedPayload::Tick)
+                    .await
+                    .context("failed to send msg")?;
+            }
+            () = cancel.cancelled() => {
+                return Ok(())
+            }
+        }
+    }
+}
+
 impl Node for GrowNode {
     type Payload = GrowNodePayload;
     type PayloadSupplied = SuppliedPayload;
@@ -264,27 +279,7 @@ impl Node for GrowNode {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
-        tracker.spawn({
-            let cancel = cancel.clone();
-            async move {
-                let mut ticker = tokio::time::interval(Duration::from_millis(100));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-                loop {
-                    select! {
-                        _ = ticker.tick() => {
-                            tx.send(SuppliedPayload::Tick)
-                                .await
-                                .context("failed to send msg")?;
-
-                        }
-                        _ = cancel.cancelled() => {
-                            return Ok::<_, anyhow::Error>(())
-                        }
-                    }
-                }
-            }
-        });
+        tracker.spawn(ticker_loop(cancel.clone(), tx.clone()));
 
         Ok(GrowNode {
             inner: Arc::new(GrowNodeInner {

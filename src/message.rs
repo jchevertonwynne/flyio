@@ -33,7 +33,7 @@ impl<T> Message<Body<T>> {
     pub fn replace_payload<U>(self, new_payload: U) -> (T, Message<Body<U>>) {
         let (old_body, empty_msg) = self.extract_body();
         let (old_payload, new_body) = old_body.replace_payload(new_payload);
-        let (_, new_msg) = empty_msg.replace_body(new_body);
+        let ((), new_msg) = empty_msg.replace_body(new_body);
         (old_payload, new_msg)
     }
 }
