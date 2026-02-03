@@ -33,15 +33,17 @@ impl RouteRegistry {
     pub(crate) fn bind(&self, provider: &MsgIDProvider, slot: ServiceSlot) -> MsgIDProvider {
         let routes = Arc::clone(&self.routes);
         provider.with_hook(move |msg_id| {
-            let mut map = routes.lock().expect("route registry poisoned");
-            map.insert(msg_id, slot);
+            routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(msg_id, slot);
         })
     }
 
     pub(crate) fn take(&self, msg_id: u64) -> Option<ServiceSlot> {
         self.routes
             .lock()
-            .expect("route registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&msg_id)
     }
 }
@@ -250,7 +252,65 @@ macro_rules! impl_service_for_tuple {
 }
 
 impl_service_for_tuple!(A);
-impl_service_for_tuple!(A, B);
+impl<A: Service, B: Service> Service for (A, B) {
+    fn init(
+        id_provider: MsgIDProvider,
+        node_id: String,
+        tx: Sender<Message<Body<KvPayload>>>,
+        routes: RouteRegistry,
+        slot: ServiceSlot,
+    ) -> Self {
+        let mut slot_idx: u8 = 0;
+        (
+            {
+                let current_idx = slot_idx;
+                slot_idx += 1;
+                let _ = slot_idx;
+                let child_slot = slot.child(current_idx);
+                A::init(
+                    id_provider.clone(),
+                    node_id.clone(),
+                    tx.clone(),
+                    routes.clone(),
+                    child_slot,
+                )
+            },
+            {
+                let current_idx = slot_idx;
+                slot_idx += 1;
+                let _ = slot_idx;
+                let child_slot = slot.child(current_idx);
+                B::init(
+                    id_provider.clone(),
+                    node_id.clone(),
+                    tx.clone(),
+                    routes.clone(),
+                    child_slot,
+                )
+            },
+        )
+    }
+    async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
+        bail!("received unrouted service message: {msg:?}")
+    }
+    async fn dispatch(
+        &self,
+        slot: ServiceSlot,
+        msg: Message<Body<KvPayload>>,
+    ) -> anyhow::Result<()> {
+        let Some((idx, rest)) = slot.split() else {
+            bail!("missing child slot while dispatching tuple service");
+        };
+        let (casey::lower!(A), casey::lower!(B)) = self;
+        let mut msg = Some(msg);
+        tuple_dispatch_chain!(idx, rest, msg, 0, casey::lower!(A), casey::lower!(B))
+    }
+    async fn stop(&self) {
+        let (casey::lower!(A), casey::lower!(B)) = self;
+        casey::lower!(A).stop().await;
+        casey::lower!(B).stop().await;
+    }
+}
 impl_service_for_tuple!(A, B, C);
 impl_service_for_tuple!(A, B, C, D);
 
@@ -442,7 +502,7 @@ async fn handle_init<N: Node>(
     let (tx_supplied, rx_supplied) = channel(1);
 
     let services_init = services.clone();
-    let mut init_fut = std::pin::pin!(async move {
+    let mut init_node_fut = std::pin::pin!(async move {
         N::from_init(init, services_init, id_provider, tx_supplied)
             .await
             .context("failed to build node")
@@ -453,8 +513,8 @@ async fn handle_init<N: Node>(
 
     let node = loop {
         select! {
-            res = &mut init_fut => {
-                break res?;
+            node = &mut init_node_fut => {
+                break node?;
             }
             line = rx_stdin.recv() => {
                 let Some(line) = line else {
