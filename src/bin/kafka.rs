@@ -1,10 +1,10 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker, main_loop};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{Mutex, mpsc::Sender};
 use tracing::{error, warn};
 
 #[derive(Clone)]
@@ -19,6 +19,18 @@ struct KafkaNodeInner {
     id_provider: MsgIDProvider,
 
     kv: LinKvClient,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    pending_sends: HashMap<String, Vec<PendingSend>>,
+}
+
+struct PendingSend {
+    msg: u64,
+    client_msg: Message<Body<()>>,
+    tx: Sender<Message<Body<KafkaNodePayload>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,67 +82,15 @@ impl Send {
         node: &Kafka,
         tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let Message { src, dst, body } = msg;
-        let Body {
-            incoming_msg_id,
-            in_reply_to: _,
-            payload: (),
-        } = body;
-        let Self { key, msg } = self;
-
-        let kv_key = format!("kafka:{key}");
-        let (mut remote, mut create): (MessageDetails, bool) =
-            match node.kv.read(kv_key.clone()).await {
-                Ok(data) => (data, false),
-                Err(KvError::KeyDoesNotExist) => (MessageDetails::default(), true),
-                Err(e) => return Err(e.into()),
-            };
-
-        let mut sleep_dur = Duration::from_millis(1);
-        let offset = loop {
-            let mut entry = remote.clone();
-
-            let offset = entry.next_offset;
-            entry.next_offset += 1;
-            entry.messages.push(MessageEntry { offset, msg });
-
-            match node
-                .kv
-                .compare_and_swap(kv_key.clone(), &remote, &entry, create)
-                .await
-            {
-                Ok(true) => break offset,
-                Ok(false) => {
-                    create = false;
-                    remote = match node.kv.read(kv_key.clone()).await {
-                        Ok(data) => data,
-                        Err(KvError::KeyDoesNotExist) => MessageDetails::default(),
-                        Err(e) => return Err(e.into()),
-                    };
-                }
-                Err(KvError::KeyDoesNotExist) => {
-                    remote = MessageDetails::default();
-                    create = true;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            tokio::time::sleep(sleep_dur).await;
-            sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
+        let Self { key, msg: val } = self;
+        let pending = PendingSend {
+            msg: val,
+            client_msg: msg,
+            tx,
         };
 
-        let resp_msg_id = node.id_provider.id();
-        let response = Message {
-            src: dst,
-            dst: src,
-            body: Body {
-                incoming_msg_id: Some(resp_msg_id),
-                in_reply_to: incoming_msg_id,
-                payload: KafkaNodePayload::SendOk(SendOk { offset }),
-            },
-        };
-
-        tx.send(response).await.context("channel closed")?;
+        let mut state = node.state.lock().await;
+        state.pending_sends.entry(key).or_default().push(pending);
 
         Ok(())
     }
@@ -442,6 +402,91 @@ impl Error {
     }
 }
 
+impl Kafka {
+    async fn process_send_batch(self, key: String, batch: Vec<PendingSend>) {
+        let kv_key = format!("kafka:{key}");
+        let (mut remote, mut create): (MessageDetails, bool) =
+            match self.kv.read(kv_key.clone()).await {
+                Ok(data) => (data, false),
+                Err(KvError::KeyDoesNotExist) => (MessageDetails::default(), true),
+                Err(e) => {
+                    error!("failed to read kv for batch: {e}");
+                    return;
+                }
+            };
+
+        let mut sleep_dur = Duration::from_millis(1);
+        let start_offset = loop {
+            let mut entry = remote.clone();
+            let mut next_offset = entry.next_offset;
+
+            for pending in &batch {
+                entry.messages.push(MessageEntry {
+                    offset: next_offset,
+                    msg: pending.msg,
+                });
+                next_offset += 1;
+            }
+            entry.next_offset = next_offset;
+
+            match self
+                .kv
+                .compare_and_swap(kv_key.clone(), &remote, &entry, create)
+                .await
+            {
+                Ok(true) => break entry.next_offset - batch.len() as u64,
+                Ok(false) => {
+                    create = false;
+                    remote = match self.kv.read(kv_key.clone()).await {
+                        Ok(data) => data,
+                        Err(KvError::KeyDoesNotExist) => MessageDetails::default(),
+                        Err(e) => {
+                            error!("failed to re-read kv for batch: {e}");
+                            return;
+                        }
+                    };
+                }
+                Err(KvError::KeyDoesNotExist) => {
+                    remote = MessageDetails::default();
+                    create = true;
+                }
+                Err(e) => {
+                    error!("cas failed for batch: {e}");
+                    return;
+                }
+            }
+
+            tokio::time::sleep(sleep_dur).await;
+            sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
+        };
+
+        for (i, pending) in batch.into_iter().enumerate() {
+            let offset = start_offset + i as u64;
+            let Message { src, dst, body } = pending.client_msg;
+            let Body {
+                incoming_msg_id,
+                in_reply_to: _,
+                payload: (),
+            } = body;
+
+            let resp_msg_id = self.id_provider.id();
+            let response = Message {
+                src: dst,
+                dst: src,
+                body: Body {
+                    incoming_msg_id: Some(resp_msg_id),
+                    in_reply_to: incoming_msg_id,
+                    payload: KafkaNodePayload::SendOk(SendOk { offset }),
+                },
+            };
+
+            if let Err(e) = pending.tx.send(response).await {
+                warn!("failed to send batch response: {e}");
+            }
+        }
+    }
+}
+
 impl KafkaNodePayload {
     async fn dispatch(
         self,
@@ -466,7 +511,34 @@ impl KafkaNodePayload {
 }
 
 #[async_trait]
-impl Node<LinKvClient, ()> for Kafka {
+impl Worker<KafkaNodePayload> for Kafka {
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
+    }
+
+    async fn handle_tick(
+        &self,
+        _tx: Sender<Message<Body<KafkaNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let mut sends = HashMap::new();
+        {
+            let mut state = self.inner.state.lock().await;
+            std::mem::swap(&mut state.pending_sends, &mut sends);
+        }
+
+        for (key, batch) in sends {
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.process_send_batch(key, batch).await;
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Node<LinKvClient, Self> for Kafka {
     type Payload = KafkaNodePayload;
 
     async fn from_init(
@@ -479,6 +551,7 @@ impl Node<LinKvClient, ()> for Kafka {
                 node_id: init.node_id,
                 id_provider,
                 kv: lin_kv,
+                state: Mutex::new(State::default()),
             }),
         })
     }
@@ -492,12 +565,14 @@ impl Node<LinKvClient, ()> for Kafka {
         payload.dispatch(message, self, tx).await
     }
 
-
+    fn get_worker(&self) -> Option<Self> {
+        Some(self.clone())
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<Kafka, LinKvClient, ()>()
+    main_loop::<Kafka, LinKvClient, Kafka>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }
