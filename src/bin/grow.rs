@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, SeqKvClient, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, SeqKvClient, Worker, main_loop};
 use serde::{Deserialize, Serialize};
 use std::{
     ops::Deref,
@@ -256,8 +256,23 @@ impl GrowNodePayload {
 }
 
 #[async_trait]
-impl Node for GrowNode {
+impl Worker for GrowNode {
     type Payload = GrowNodePayload;
+
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
+    }
+
+    async fn handle_tick(&self, _tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
+        if self.propogate.load(Ordering::SeqCst) > 0 {
+            self.flush_pending().await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Node for GrowNode {
     type Service = SeqKvClient;
 
     async fn from_init(
@@ -289,17 +304,6 @@ impl Node for GrowNode {
     ) -> anyhow::Result<()> {
         let (payload, message) = msg.replace_payload(());
         payload.dispatch(message, self, tx).await
-    }
-
-    fn tick_interval(&self) -> Option<Duration> {
-        Some(Duration::from_millis(100))
-    }
-
-    async fn handle_tick(&self, _tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
-        if self.propogate.load(Ordering::SeqCst) > 0 {
-            self.flush_pending().await?;
-        }
-        Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {

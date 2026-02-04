@@ -25,7 +25,9 @@ impl SimpleNode for EchoNode {
         _init: Init,
         id_provider: MsgIDProvider,
     ) -> anyhow::Result<Self> {
-        Ok(EchoNode { id_provider })
+        Ok(EchoNode {
+            id_provider,
+        })
     }
 
     async fn handle_simple(

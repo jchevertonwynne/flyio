@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -17,15 +17,13 @@ use crate::message::{Body, Init, Message, MinBody, PayloadInit};
 
 use super::routes::{RouteRegistry, ServiceSlot};
 use super::service::Service;
+use super::worker::Worker;
 
 #[async_trait]
 pub trait SimpleNode: Clone + Sized + Send + Sync + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
 
-    async fn from_init_simple(
-        init: Init,
-        id_provider: MsgIDProvider,
-    ) -> anyhow::Result<Self>;
+    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self>;
 
     async fn handle_simple(
         &self,
@@ -50,8 +48,23 @@ pub trait SimpleNode: Clone + Sized + Send + Sync + 'static {
 }
 
 #[async_trait]
-pub trait Node: Clone + Sized + Send + Sync + 'static {
-    type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
+impl<T> Worker for T
+where
+    T: SimpleNode,
+{
+    type Payload = T::Payload;
+
+    fn tick_interval(&self) -> Option<Duration> {
+        SimpleNode::tick_interval(self)
+    }
+
+    async fn handle_tick(&self, tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
+        SimpleNode::handle_tick_simple(self, tx).await
+    }
+}
+
+#[async_trait]
+pub trait Node: Worker + Clone + Sized + Send + Sync + 'static {
     type Service: Service;
 
     async fn from_init(
@@ -67,17 +80,6 @@ pub trait Node: Clone + Sized + Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     async fn stop(&self) -> anyhow::Result<()>;
-
-    fn tick_interval(&self) -> Option<Duration> {
-        None
-    }
-
-    async fn handle_tick(
-        &self,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -85,7 +87,6 @@ impl<T> Node for T
 where
     T: SimpleNode,
 {
-    type Payload = T::Payload;
     type Service = ();
 
     async fn from_init(
@@ -106,17 +107,6 @@ where
 
     async fn stop(&self) -> anyhow::Result<()> {
         T::stop_simple(self).await
-    }
-
-    fn tick_interval(&self) -> Option<Duration> {
-        T::tick_interval(self)
-    }
-
-    async fn handle_tick(
-        &self,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        T::handle_tick_simple(self, tx).await
     }
 }
 

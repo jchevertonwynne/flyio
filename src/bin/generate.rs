@@ -36,10 +36,7 @@ enum GeneratePayload {
 impl SimpleNode for GenerateNode {
     type Payload = GeneratePayload;
 
-    async fn from_init_simple(
-        init: Init,
-        id_provider: MsgIDProvider,
-    ) -> anyhow::Result<Self> {
+    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,

@@ -2,10 +2,12 @@ mod io;
 mod node;
 mod routes;
 mod service;
+mod worker;
 
 pub use node::{Node, SimpleNode};
 pub use routes::ServiceSlot;
 pub use service::Service;
+pub use worker::{NoWorker, Worker};
 
 use anyhow::Context;
 use tokio::select;
