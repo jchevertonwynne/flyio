@@ -1,5 +1,4 @@
 use anyhow::{Context, bail};
-use enum_dispatch::enum_dispatch;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
@@ -63,7 +62,6 @@ pub struct TsOk {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[enum_dispatch(HandleKvPayload, HandleTsoPayload)]
 pub enum KvPayload {
     Read(Read),
     ReadOk(ReadOk),
@@ -76,7 +74,38 @@ pub enum KvPayload {
     TsOk(TsOk),
 }
 
-#[enum_dispatch]
+impl HandleKvPayload for KvPayload {
+    async fn handle_kv(self, reply_id: u64, tx: &Sender<KvMsg>) -> anyhow::Result<()> {
+        match self {
+            KvPayload::Read(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::ReadOk(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::Write(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::WriteOk(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::Cas(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::CasOk(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::Error(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::Ts(p) => p.handle_kv(reply_id, tx).await,
+            KvPayload::TsOk(p) => p.handle_kv(reply_id, tx).await,
+        }
+    }
+}
+
+impl HandleTsoPayload for KvPayload {
+    async fn handle_tso(self, reply_id: u64, tx: &Sender<TsoMsg>) -> anyhow::Result<()> {
+        match self {
+            KvPayload::Read(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::ReadOk(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::Write(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::WriteOk(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::Cas(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::CasOk(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::Error(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::Ts(p) => p.handle_tso(reply_id, tx).await,
+            KvPayload::TsOk(p) => p.handle_tso(reply_id, tx).await,
+        }
+    }
+}
+
 pub(crate) trait HandleKvPayload {
     async fn handle_kv(self, reply_id: u64, tx: &Sender<KvMsg>) -> anyhow::Result<()>
     where
@@ -88,7 +117,6 @@ pub(crate) trait HandleKvPayload {
     }
 }
 
-#[enum_dispatch]
 pub(crate) trait HandleTsoPayload {
     async fn handle_tso(self, reply_id: u64, tx: &Sender<TsoMsg>) -> anyhow::Result<()>
     where

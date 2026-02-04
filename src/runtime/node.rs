@@ -106,7 +106,7 @@ where
 
     let Message { src, dst, body } = init_msg;
     let Body {
-        incoming_msg_id: id,
+        incoming_msg_id,
         in_reply_to: _,
         payload,
     } = body;
@@ -123,10 +123,13 @@ where
     );
 
     let services_init = services.clone();
-    let mut init_node_fut = std::pin::pin!(async move {
-        N::from_init(init, services_init, id_provider)
-            .await
-            .context("failed to build node")
+    let mut init_node_fut = std::pin::pin!({
+        let id_provider = id_provider.clone();
+        async move {
+            N::from_init(init, services_init, id_provider)
+                .await
+                .context("failed to build node")
+        }
     });
 
     let services_clone = services.clone();
@@ -159,8 +162,8 @@ where
         src: dst,
         dst: src,
         body: Body {
-            incoming_msg_id: Some(0),
-            in_reply_to: id,
+            incoming_msg_id: Some(id_provider.id()),
+            in_reply_to: incoming_msg_id,
             payload: PayloadInit::InitOk,
         },
     };
