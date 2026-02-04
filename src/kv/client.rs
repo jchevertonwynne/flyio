@@ -1,11 +1,11 @@
 use anyhow::Context;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use tokio::select;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -19,8 +19,8 @@ use super::messages::{
 };
 use super::payload::{Cas, HandleKvPayload, HandleTsoPayload, KvPayload, Read, Ts, Write};
 use super::types::{
-    KvError, LinStore, LwwStore, MsgIDProvider, SeqStore, StoreName,
-    ERROR_CODE_KEY_NOT_EXIST, ERROR_CODE_PRECONDITION_FAILED,
+    ERROR_CODE_KEY_NOT_EXIST, ERROR_CODE_PRECONDITION_FAILED, KvError, LinStore, LwwStore,
+    MsgIDProvider, SeqStore, StoreName,
 };
 
 /// Helper function to deliver responses to waiting channels
@@ -429,7 +429,8 @@ impl KvMsgRead {
         debug!(msg_id, waiting_reads, "kv sending read request");
 
         let msg = handler.make_store_message(KvPayload::Read(Read { key: self.key }), msg_id);
-        handler.tx_payload
+        handler
+            .tx_payload
             .send(msg)
             .await
             .context("failed to send read msg")
@@ -443,8 +444,15 @@ impl KvMsgWrite {
         let waiting_writes = handler.waiters.write.len();
         debug!(msg_id, waiting_writes, "kv sending write request");
 
-        let msg = handler.make_store_message(KvPayload::Write(Write { key: self.key, value: self.value }), msg_id);
-        handler.tx_payload
+        let msg = handler.make_store_message(
+            KvPayload::Write(Write {
+                key: self.key,
+                value: self.value,
+            }),
+            msg_id,
+        );
+        handler
+            .tx_payload
             .send(msg)
             .await
             .context("failed to send write msg")
@@ -473,7 +481,8 @@ impl KvMsgCmpAndSwp {
             }),
             msg_id,
         );
-        handler.tx_payload
+        handler
+            .tx_payload
             .send(msg)
             .await
             .context("failed to send cmp_and_swp msg")
@@ -493,12 +502,7 @@ impl KvMsgReadResponse {
 
 impl KvMsgWriteResponse {
     fn handle(self, handler: &mut KvHandler<'_>) {
-        deliver_response(
-            &mut handler.waiters.write,
-            self.msg_id,
-            Ok(()),
-            "write",
-        );
+        deliver_response(&mut handler.waiters.write, self.msg_id, Ok(()), "write");
         debug!(
             msg_id = self.msg_id,
             waiting_writes = handler.waiters.write.len(),

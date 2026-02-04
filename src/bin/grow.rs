@@ -256,14 +256,12 @@ impl GrowNodePayload {
 }
 
 #[async_trait]
-impl Worker for GrowNode {
-    type Payload = GrowNodePayload;
-
+impl Worker<GrowNodePayload> for GrowNode {
     fn tick_interval(&self) -> Option<Duration> {
         Some(Duration::from_millis(100))
     }
 
-    async fn handle_tick(&self, _tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
+    async fn handle_tick(&self, _tx: Sender<Message<Body<GrowNodePayload>>>) -> anyhow::Result<()> {
         if self.propogate.load(Ordering::SeqCst) > 0 {
             self.flush_pending().await?;
         }
@@ -272,8 +270,8 @@ impl Worker for GrowNode {
 }
 
 #[async_trait]
-impl Node for GrowNode {
-    type Service = SeqKvClient;
+impl Node<SeqKvClient, Self> for GrowNode {
+    type Payload = GrowNodePayload;
 
     async fn from_init(
         init: Init,
@@ -306,14 +304,15 @@ impl Node for GrowNode {
         payload.dispatch(message, self, tx).await
     }
 
-    async fn stop(&self) -> anyhow::Result<()> {
-        Ok(())
+
+    fn get_worker(&self) -> Option<Self> {
+        Some(self.clone())
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<GrowNode>()
+    main_loop::<GrowNode, SeqKvClient, GrowNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }

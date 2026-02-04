@@ -20,104 +20,35 @@ use super::service::Service;
 use super::worker::Worker;
 
 #[async_trait]
-pub trait SimpleNode: Clone + Sized + Send + Sync + 'static {
+pub trait Node<S, W>: Clone + Sized + Send + Sync + 'static {
     type Payload: Debug + Serialize + DeserializeOwned + Send + 'static;
 
-    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self>;
+    async fn from_init(init: Init, service: S, id_provider: MsgIDProvider) -> anyhow::Result<Self>;
 
-    async fn handle_simple(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
     ) -> anyhow::Result<()>;
 
-    async fn stop_simple(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn tick_interval(&self) -> Option<Duration> {
+    fn get_worker(&self) -> Option<W> {
         None
     }
-
-    async fn handle_tick_simple(
-        &self,
-        _tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
-#[async_trait]
-impl<T> Worker for T
-where
-    T: SimpleNode,
-{
-    type Payload = T::Payload;
-
-    fn tick_interval(&self) -> Option<Duration> {
-        SimpleNode::tick_interval(self)
-    }
-
-    async fn handle_tick(&self, tx: Sender<Message<Body<Self::Payload>>>) -> anyhow::Result<()> {
-        SimpleNode::handle_tick_simple(self, tx).await
-    }
-}
-
-#[async_trait]
-pub trait Node: Worker + Clone + Sized + Send + Sync + 'static {
-    type Service: Service;
-
-    async fn from_init(
-        init: Init,
-        service: Self::Service,
-        id_provider: MsgIDProvider,
-    ) -> anyhow::Result<Self>;
-
-    async fn handle(
-        &self,
-        msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()>;
-
-    async fn stop(&self) -> anyhow::Result<()>;
-}
-
-#[async_trait]
-impl<T> Node for T
-where
-    T: SimpleNode,
-{
-    type Service = ();
-
-    async fn from_init(
-        init: Init,
-        _service: Self::Service,
-        id_provider: MsgIDProvider,
-    ) -> anyhow::Result<Self> {
-        T::from_init_simple(init, id_provider).await
-    }
-
-    async fn handle(
-        &self,
-        msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        T::handle_simple(self, msg, tx).await
-    }
-
-    async fn stop(&self) -> anyhow::Result<()> {
-        T::stop_simple(self).await
-    }
-}
-
-pub(crate) async fn process_line<N: Node>(
+pub(crate) async fn process_line<N, S, W>(
     line: String,
-    services: &N::Service,
+    services: &S,
     node: &N,
     tx_node: &Sender<Message<Body<N::Payload>>>,
     routes: &RouteRegistry,
     set: &mut JoinSet<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    N: Node<S, W>,
+    S: Service,
+    W: Worker<N::Payload>,
+{
     let (msg, min_body) = parse_envelope(line.as_str())?;
     let Some(msg) = handle_service_message(msg, &min_body, services, routes).await? else {
         return Ok(());
@@ -136,11 +67,15 @@ pub(crate) async fn process_line<N: Node>(
     Ok(())
 }
 
-pub(crate) async fn handle_node_message<N: Node>(
+pub(crate) async fn handle_node_message<N, S, W>(
     msg: Message<Body<N::Payload>>,
     node: N,
     tx: Sender<Message<Body<N::Payload>>>,
-) {
+) where
+    N: Node<S, W>,
+    S: Service,
+    W: Worker<N::Payload>,
+{
     debug!("handling msg {msg:?}");
     let resp = node.handle(msg, tx).await;
     if let Err(err) = resp {
@@ -148,13 +83,18 @@ pub(crate) async fn handle_node_message<N: Node>(
     }
 }
 
-pub(crate) async fn handle_init<N: Node>(
+pub(crate) async fn handle_init<N, S, W>(
     rx_stdin: &mut Receiver<anyhow::Result<String>>,
     id_provider: MsgIDProvider,
     tx_kv: Sender<Message<Body<KvPayload>>>,
     tx_init: Sender<Message<Body<PayloadInit>>>,
     routes: RouteRegistry,
-) -> Result<(N, N::Service, Vec<String>), anyhow::Error> {
+) -> Result<(N, S, Vec<String>), anyhow::Error>
+where
+    N: Node<S, W>,
+    S: Service,
+    W: Worker<N::Payload>,
+{
     let line = rx_stdin
         .recv()
         .await
@@ -174,7 +114,7 @@ pub(crate) async fn handle_init<N: Node>(
         bail!("should not receive an InitOk msg first")
     };
 
-    let services = N::Service::init(
+    let services = S::init(
         id_provider.clone(),
         init.node_id.clone(),
         tx_kv,
@@ -269,12 +209,15 @@ fn parse_envelope<'a>(line: &'a str) -> anyhow::Result<(Message<&'a RawValue>, M
     Ok((msg, min_body))
 }
 
-pub(crate) async fn run_node_ticks<N: Node>(
-    node: N,
-    tx: Sender<Message<Body<N::Payload>>>,
+pub(crate) async fn run_node_ticks<W, P>(
+    worker: W,
+    tx: Sender<Message<Body<P>>>,
     cancel: CancellationToken,
     period: Duration,
-) {
+) where
+    P: Send + 'static,
+    W: Worker<P>,
+{
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -286,7 +229,7 @@ pub(crate) async fn run_node_ticks<N: Node>(
             }
             _ = ticker.tick() => {
                 debug!("dispatching node tick");
-                if let Err(err) = node.handle_tick(tx.clone()).await {
+                if let Err(err) = worker.handle_tick(tx.clone()).await {
                     error!("node tick failed: {err}");
                 }
             }

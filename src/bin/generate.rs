@@ -2,7 +2,7 @@ use std::{ops::Deref, sync::Arc};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 use tracing::error;
@@ -33,10 +33,14 @@ enum GeneratePayload {
 }
 
 #[async_trait]
-impl SimpleNode for GenerateNode {
+impl Node<(), ()> for GenerateNode {
     type Payload = GeneratePayload;
 
-    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self> {
+    async fn from_init(
+        init: Init,
+        _service: (),
+        id_provider: MsgIDProvider,
+    ) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,
@@ -50,7 +54,7 @@ impl SimpleNode for GenerateNode {
         })
     }
 
-    async fn handle_simple(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
@@ -89,11 +93,12 @@ impl SimpleNode for GenerateNode {
 
         Ok(())
     }
+    
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<GenerateNode>()
+    main_loop::<GenerateNode, (), ()>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }

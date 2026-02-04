@@ -6,4 +6,4 @@ pub use kv::{
     KvClient, KvError, KvPayload, LinKvClient, LwwKvClient, MsgIDProvider, SeqKvClient, TsoClient,
 };
 pub use message::{Body, Init, Message, MinBody, PayloadInit};
-pub use runtime::{NoWorker, Node, SimpleNode, Worker, main_loop};
+pub use runtime::{Node, Worker, main_loop};

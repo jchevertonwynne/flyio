@@ -4,10 +4,10 @@ mod routes;
 mod service;
 mod worker;
 
-pub use node::{Node, SimpleNode};
+pub use node::Node;
 pub use routes::ServiceSlot;
 pub use service::Service;
-pub use worker::{NoWorker, Worker};
+pub use worker::Worker;
 
 use anyhow::Context;
 use tokio::select;
@@ -34,7 +34,12 @@ use tokio_util::sync::CancellationToken;
 /// - Node initialization fails
 /// - The writer task panics
 /// - Node cleanup fails
-pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
+pub async fn main_loop<N, S, W>() -> anyhow::Result<()>
+where
+    N: Node<S, W>,
+    S: Service,
+    W: Worker<N::Payload>,
+{
     init_tracing();
 
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -49,13 +54,13 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     let id_provider = MsgIDProvider::new();
     let routes = RouteRegistry::new();
 
-    let writer_handle = tokio::spawn(stdout_writer_loop::<N>(rx_node, rx_kv, rx_init));
+    let writer_handle = tokio::spawn(stdout_writer_loop::<N, S, W>(rx_node, rx_kv, rx_init));
 
     let (node, services, buffered) = select! {
         _ = &mut shutdown => {
             return Ok(())
         }
-        res = handle_init::<N>(&mut stdin, id_provider, tx_kv, tx_init, routes.clone()) => {
+        res = handle_init::<N, S, W>(&mut stdin, id_provider, tx_kv, tx_init, routes.clone()) => {
             res?
         }
     };
@@ -63,11 +68,12 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     let mut set = JoinSet::new();
 
     let tick_cancel = CancellationToken::new();
-    if let Some(period) = node.tick_interval() {
-        let node_clone = node.clone();
+    if let Some(worker) = node.get_worker()
+        && let Some(period) = worker.tick_interval()
+    {
         let tx_clone = tx_node.clone();
         let cancel = tick_cancel.clone();
-        set.spawn(run_node_ticks(node_clone, tx_clone, cancel, period));
+        set.spawn(run_node_ticks(worker, tx_clone, cancel, period));
     }
 
     for line in buffered {
@@ -107,7 +113,6 @@ pub async fn main_loop<N: Node>() -> anyhow::Result<()> {
     info!("about to wait for writer task");
     writer_handle.await.context("writer task panicked")?;
     info!("about to wait for node");
-    node.stop().await.context("failed to stop node")?;
     services.stop().await;
     info!("goodbye!");
 

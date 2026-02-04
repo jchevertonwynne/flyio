@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 use tracing::error;
@@ -18,19 +18,18 @@ enum EchoPayload {
 }
 
 #[async_trait]
-impl SimpleNode for EchoNode {
+impl Node<(), ()> for EchoNode {
     type Payload = EchoPayload;
 
-    async fn from_init_simple(
+    async fn from_init(
         _init: Init,
+        _service: (),
         id_provider: MsgIDProvider,
     ) -> anyhow::Result<Self> {
-        Ok(EchoNode {
-            id_provider,
-        })
+        Ok(EchoNode { id_provider })
     }
 
-    async fn handle_simple(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
@@ -66,7 +65,7 @@ impl SimpleNode for EchoNode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<EchoNode>()
+    main_loop::<EchoNode, (), ()>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }

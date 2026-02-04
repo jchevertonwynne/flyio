@@ -1,8 +1,6 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{
-    Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker, main_loop,
-};
+use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, main_loop};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
@@ -468,13 +466,8 @@ impl KafkaNodePayload {
 }
 
 #[async_trait]
-impl Worker for Kafka {
+impl Node<LinKvClient, ()> for Kafka {
     type Payload = KafkaNodePayload;
-}
-
-#[async_trait]
-impl Node for Kafka {
-    type Service = LinKvClient;
 
     async fn from_init(
         init: Init,
@@ -499,14 +492,12 @@ impl Node for Kafka {
         payload.dispatch(message, self, tx).await
     }
 
-    async fn stop(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
+
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<Kafka>()
+    main_loop::<Kafka, LinKvClient, ()>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }

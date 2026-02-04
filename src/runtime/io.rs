@@ -11,7 +11,7 @@ use crate::message::{Body, Message, PayloadInit};
 
 use super::node::Node;
 
-pub(crate) async fn stdout_writer_loop<N: Node>(
+pub(crate) async fn stdout_writer_loop<N: Node<S, W>, S, W>(
     mut rx_node: Receiver<Message<Body<N::Payload>>>,
     mut rx_kv: Receiver<Message<Body<KvPayload>>>,
     mut rx_init: Receiver<Message<Body<PayloadInit>>>,

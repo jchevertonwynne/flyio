@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, SimpleNode, main_loop};
+use flyio::{Body, Init, Message, MsgIDProvider, Node, Worker, main_loop};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -387,10 +387,45 @@ impl BroadcastNodePayload {
 }
 
 #[async_trait]
-impl SimpleNode for BroadcastNode {
+impl Worker<BroadcastNodePayload> for BroadcastNode {
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
+    }
+
+    async fn handle_tick(
+        &self,
+        tx: Sender<Message<Body<BroadcastNodePayload>>>,
+    ) -> anyhow::Result<()> {
+        let plan = self.flush_pending().await;
+
+        for (unseen_neighbour, messages) in plan {
+            let msg_id = self.id_provider.id();
+            tx.send(Message {
+                src: self.node_id.clone(),
+                dst: unseen_neighbour,
+                body: Body {
+                    incoming_msg_id: Some(msg_id),
+                    in_reply_to: None,
+                    payload: BroadcastNodePayload::SendMin(SendMin { messages }),
+                },
+            })
+            .await
+            .context("failed to send supplied msg")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Node<(), Self> for BroadcastNode {
     type Payload = BroadcastNodePayload;
 
-    async fn from_init_simple(init: Init, id_provider: MsgIDProvider) -> anyhow::Result<Self> {
+    async fn from_init(
+        init: Init,
+        _service: (),
+        id_provider: MsgIDProvider,
+    ) -> anyhow::Result<Self> {
         let Init {
             node_id,
             node_ids: _,
@@ -408,7 +443,7 @@ impl SimpleNode for BroadcastNode {
         })
     }
 
-    async fn handle_simple(
+    async fn handle(
         &self,
         msg: Message<Body<Self::Payload>>,
         tx: Sender<Message<Body<Self::Payload>>>,
@@ -437,38 +472,14 @@ impl SimpleNode for BroadcastNode {
         payload.dispatch(msg, self, tx).await
     }
 
-    fn tick_interval(&self) -> Option<Duration> {
-        Some(Duration::from_millis(100))
-    }
-
-    async fn handle_tick_simple(
-        &self,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
-        let plan = self.flush_pending().await;
-
-        for (unseen_neighbour, messages) in plan {
-            let msg_id = self.id_provider.id();
-            tx.send(Message {
-                src: self.node_id.clone(),
-                dst: unseen_neighbour,
-                body: Body {
-                    incoming_msg_id: Some(msg_id),
-                    in_reply_to: None,
-                    payload: BroadcastNodePayload::SendMin(SendMin { messages }),
-                },
-            })
-            .await
-            .context("failed to send supplied msg")?;
-        }
-
-        Ok(())
+    fn get_worker(&self) -> Option<Self> {
+        Some(self.clone())
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    main_loop::<BroadcastNode>()
+    main_loop::<BroadcastNode, (), BroadcastNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
 }

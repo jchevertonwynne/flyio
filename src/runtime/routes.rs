@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::kv::MsgIDProvider;
 
 #[derive(Clone)]
-pub(crate) struct RouteRegistry {
+pub struct RouteRegistry {
     routes: Arc<Mutex<HashMap<u64, ServiceSlot>>>,
 }
 
