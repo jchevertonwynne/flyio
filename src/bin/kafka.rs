@@ -13,9 +13,6 @@ struct Kafka {
 }
 
 struct KafkaNodeInner {
-    #[allow(dead_code)]
-    node_id: String,
-    #[allow(dead_code)]
     id_provider: MsgIDProvider,
 
     kv: LinKvClient,
@@ -254,6 +251,10 @@ impl CommitOffsets {
             'cas: loop {
                 let mut entry_copy = entry.clone();
                 entry_copy.committed_offset = entry_copy.committed_offset.max(offset);
+                let cutoff = entry_copy
+                    .messages
+                    .partition_point(|msg| msg.offset < entry_copy.committed_offset);
+                entry_copy.messages.drain(..cutoff);
 
                 match node
                     .kv
@@ -494,18 +495,20 @@ impl KafkaNodePayload {
         node: &Kafka,
         tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
+        use KafkaNodePayload::{
+            CommitOffsets, CommitOffsetsOk, Error, ListCommittedOffsets, ListCommittedOffsetsOk,
+            Poll, PollOk, Send, SendOk,
+        };
         match self {
-            KafkaNodePayload::Send(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::SendOk(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::Poll(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::PollOk(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::CommitOffsets(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::CommitOffsetsOk(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::ListCommittedOffsets(payload) => payload.handle(msg, node, tx).await,
-            KafkaNodePayload::ListCommittedOffsetsOk(payload) => {
-                payload.handle(msg, node, tx).await
-            }
-            KafkaNodePayload::Error(payload) => payload.handle(msg, node, tx).await,
+            Send(payload) => payload.handle(msg, node, tx).await,
+            SendOk(payload) => payload.handle(msg, node, tx).await,
+            Poll(payload) => payload.handle(msg, node, tx).await,
+            PollOk(payload) => payload.handle(msg, node, tx).await,
+            CommitOffsets(payload) => payload.handle(msg, node, tx).await,
+            CommitOffsetsOk(payload) => payload.handle(msg, node, tx).await,
+            ListCommittedOffsets(payload) => payload.handle(msg, node, tx).await,
+            ListCommittedOffsetsOk(payload) => payload.handle(msg, node, tx).await,
+            Error(payload) => payload.handle(msg, node, tx).await,
         }
     }
 }
@@ -542,13 +545,12 @@ impl Node<LinKvClient, Self> for Kafka {
     type Payload = KafkaNodePayload;
 
     async fn from_init(
-        init: Init,
+        _init: Init,
         lin_kv: LinKvClient,
         id_provider: MsgIDProvider,
     ) -> anyhow::Result<Self> {
         Ok(Kafka {
             inner: Arc::new(KafkaNodeInner {
-                node_id: init.node_id,
                 id_provider,
                 kv: lin_kv,
                 state: Mutex::new(State::default()),
