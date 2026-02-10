@@ -122,7 +122,7 @@ macro_rules! impl_service_for_tuple {
                         {
                             let current_idx = slot_idx;
                             slot_idx += 1;
-                            let _ = slot_idx;
+                            _ = slot_idx; // silence warnings for final tuple value
                             let child_slot = slot.child(current_idx);
                             $name::init(
                                 id_provider.clone(),
@@ -159,73 +159,17 @@ macro_rules! impl_service_for_tuple {
 
             async fn stop(&self) {
                 let ( $( casey::lower!($name), )+ ) = self;
-                $(
-                    casey::lower!($name).stop().await;
-                )+
+                tokio::join!(
+                    $(
+                        casey::lower!($name).stop(),
+                    )+
+                );
             }
         }
     };
 }
 
 impl_service_for_tuple!(A);
-impl<A: Service, B: Service> Service for (A, B) {
-    fn init(
-        id_provider: MsgIDProvider,
-        node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
-        routes: RouteRegistry,
-        slot: ServiceSlot,
-    ) -> Self {
-        let mut slot_idx: u8 = 0;
-        (
-            {
-                let current_idx = slot_idx;
-                slot_idx += 1;
-                let _ = slot_idx;
-                let child_slot = slot.child(current_idx);
-                A::init(
-                    id_provider.clone(),
-                    node_id.clone(),
-                    tx.clone(),
-                    routes.clone(),
-                    child_slot,
-                )
-            },
-            {
-                let current_idx = slot_idx;
-                slot_idx += 1;
-                let _ = slot_idx;
-                let child_slot = slot.child(current_idx);
-                B::init(
-                    id_provider.clone(),
-                    node_id.clone(),
-                    tx.clone(),
-                    routes.clone(),
-                    child_slot,
-                )
-            },
-        )
-    }
-    async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
-        bail!("received unrouted service message: {msg:?}")
-    }
-    async fn dispatch(
-        &self,
-        slot: ServiceSlot,
-        msg: Message<Body<KvPayload>>,
-    ) -> anyhow::Result<()> {
-        let Some((idx, rest)) = slot.split() else {
-            bail!("missing child slot while dispatching tuple service");
-        };
-        let (casey::lower!(A), casey::lower!(B)) = self;
-        let mut msg = Some(msg);
-        tuple_dispatch_chain!(idx, rest, msg, 0, casey::lower!(A), casey::lower!(B))
-    }
-    async fn stop(&self) {
-        let (casey::lower!(A), casey::lower!(B)) = self;
-        casey::lower!(A).stop().await;
-        casey::lower!(B).stop().await;
-    }
-}
+impl_service_for_tuple!(A, B);
 impl_service_for_tuple!(A, B, C);
 impl_service_for_tuple!(A, B, C, D);

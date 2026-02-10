@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker, main_loop};
+use futures::future::try_join_all;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
@@ -107,7 +108,6 @@ impl SendOk {
         _node: &Kafka,
         _tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected SendOk message")
     }
 }
@@ -132,27 +132,35 @@ impl Poll {
             payload: (),
         } = body;
         let Self { offsets } = self;
-        let mut result = HashMap::new();
-
-        for (key, offset) in offsets {
-            match node.kv.read::<MessageDetails>(format!("kafka:{key}")).await {
-                Ok(details) => {
-                    let filtered: Vec<PollOkMessageEntry> = details
-                        .messages
-                        .iter()
-                        .filter(|&entry| entry.offset >= offset)
-                        .map(|entry| PollOkMessageEntry {
-                            offset: entry.offset,
-                            msg: entry.msg,
-                        })
-                        .collect();
-                    if !filtered.is_empty() {
-                        result.insert(key, filtered);
+        let read_futs = offsets.into_iter().map(|(key, offset)| {
+            let kv = node.kv.clone();
+            async move {
+                match kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                    Ok(details) => {
+                        let filtered: Vec<PollOkMessageEntry> = details
+                            .messages
+                            .iter()
+                            .filter(|&entry| entry.offset >= offset)
+                            .map(|entry| PollOkMessageEntry {
+                                offset: entry.offset,
+                                msg: entry.msg,
+                            })
+                            .collect();
+                        if filtered.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some((key, filtered)))
+                        }
                     }
+                    Err(KvError::KeyDoesNotExist) => Ok(None),
+                    Err(e) => Err(e),
                 }
-                Err(KvError::KeyDoesNotExist) => {}
-                Err(e) => return Err(e.into()),
             }
+        });
+
+        let mut result = HashMap::new();
+        for (key, filtered) in (try_join_all(read_futs).await?).into_iter().flatten() {
+            result.insert(key, filtered);
         }
 
         let resp_msg_id = node.id_provider.id();
@@ -213,7 +221,6 @@ impl PollOk {
         _node: &Kafka,
         _tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected PollOk message")
     }
 }
@@ -238,44 +245,12 @@ impl CommitOffsets {
             payload: (),
         } = body;
         let Self { offsets } = self;
+        let commit_tasks = offsets.into_iter().map(|(key, offset)| {
+            let node = node.clone();
+            async move { node.commit_offset_for_key(key, offset).await }
+        });
 
-        for (key, offset) in offsets {
-            let key = format!("kafka:{key}");
-            let mut entry = match node.kv.read::<MessageDetails>(key.clone()).await {
-                Ok(entry) => entry,
-                Err(KvError::KeyDoesNotExist) => continue,
-                Err(e) => return Err(e.into()),
-            };
-
-            let mut sleep_dur = Duration::from_millis(1);
-            'cas: loop {
-                let mut entry_copy = entry.clone();
-                entry_copy.committed_offset = entry_copy.committed_offset.max(offset);
-                let cutoff = entry_copy
-                    .messages
-                    .partition_point(|msg| msg.offset < entry_copy.committed_offset);
-                entry_copy.messages.drain(..cutoff);
-
-                match node
-                    .kv
-                    .compare_and_swap(key.clone(), &entry, &entry_copy, false)
-                    .await
-                {
-                    Ok(true) | Err(KvError::KeyDoesNotExist) => break 'cas,
-                    Ok(false) => {
-                        entry = match node.kv.read(key.clone()).await {
-                            Ok(next) => next,
-                            Err(KvError::KeyDoesNotExist) => break 'cas,
-                            Err(e) => return Err(e.into()),
-                        };
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-
-                tokio::time::sleep(sleep_dur).await;
-                sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
-            }
-        }
+        try_join_all(commit_tasks).await?;
 
         let resp_msg_id = node.id_provider.id();
         let response = Message {
@@ -305,7 +280,6 @@ impl CommitOffsetsOk {
         _node: &Kafka,
         _tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected CommitOffsetsOk message")
     }
 }
@@ -330,18 +304,21 @@ impl ListCommittedOffsets {
             payload: (),
         } = body;
         let Self { keys } = self;
+        let kv = node.kv.clone();
+        let read_futs = keys.into_iter().map(|key| {
+            let kv = kv.clone();
+            async move {
+                match kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                    Ok(val) => Ok((key, val.committed_offset)),
+                    Err(KvError::KeyDoesNotExist) => Ok((key, 0)),
+                    Err(e) => Err(e),
+                }
+            }
+        });
 
         let mut result = HashMap::new();
-        for key in keys {
-            match node.kv.read::<MessageDetails>(format!("kafka:{key}")).await {
-                Ok(val) => {
-                    result.insert(key, val.committed_offset);
-                }
-                Err(KvError::KeyDoesNotExist) => {
-                    result.insert(key, 0);
-                }
-                Err(e) => return Err(e.into()),
-            }
+        for (key, offset) in try_join_all(read_futs).await? {
+            result.insert(key, offset);
         }
 
         let resp_msg_id = node.id_provider.id();
@@ -376,7 +353,6 @@ impl ListCommittedOffsetsOk {
         _node: &Kafka,
         _tx: Sender<Message<Body<KafkaNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected ListCommittedOffsetsOk message")
     }
 }
@@ -485,6 +461,46 @@ impl Kafka {
                 warn!("failed to send batch response: {e}");
             }
         }
+    }
+
+    async fn commit_offset_for_key(&self, key: String, offset: u64) -> anyhow::Result<()> {
+        let key = format!("kafka:{key}");
+        let mut entry = match self.kv.read::<MessageDetails>(key.clone()).await {
+            Ok(entry) => entry,
+            Err(KvError::KeyDoesNotExist) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut sleep_dur = Duration::from_millis(1);
+        'cas: loop {
+            let mut entry_copy = entry.clone();
+            entry_copy.committed_offset = entry_copy.committed_offset.max(offset);
+            let cutoff = entry_copy
+                .messages
+                .partition_point(|msg| msg.offset < entry_copy.committed_offset);
+            entry_copy.messages.drain(..cutoff);
+
+            match self
+                .kv
+                .compare_and_swap(key.clone(), &entry, &entry_copy, false)
+                .await
+            {
+                Ok(true) | Err(KvError::KeyDoesNotExist) => break 'cas,
+                Ok(false) => {
+                    entry = match self.kv.read(key.clone()).await {
+                        Ok(next) => next,
+                        Err(KvError::KeyDoesNotExist) => break 'cas,
+                        Err(e) => return Err(e.into()),
+                    };
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            tokio::time::sleep(sleep_dur).await;
+            sleep_dur = (sleep_dur * 2).min(Duration::from_millis(100));
+        }
+
+        Ok(())
     }
 }
 

@@ -136,7 +136,6 @@ impl AddOk {
         _node: &GrowNode,
         _tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected AddOk message")
     }
 }
@@ -211,7 +210,6 @@ impl ReadOk {
         _node: &GrowNode,
         _tx: Sender<Message<Body<GrowNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected ReadOk message")
     }
 }

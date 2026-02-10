@@ -45,12 +45,6 @@ enum Op {
     Write(u64, u64),
 }
 
-#[derive(Debug, Clone)]
-enum OpResult {
-    Read(u64, Option<u64>),
-    Write(u64, u64),
-}
-
 impl Serialize for Op {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -64,28 +58,6 @@ impl Serialize for Op {
                 state.serialize_element(&None::<u64>)?;
             }
             Op::Write(key, val) => {
-                state.serialize_element("w")?;
-                state.serialize_element(key)?;
-                state.serialize_element(&Some(val))?;
-            }
-        }
-        state.end()
-    }
-}
-
-impl Serialize for OpResult {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_tuple(3)?;
-        match self {
-            OpResult::Read(key, val) => {
-                state.serialize_element("r")?;
-                state.serialize_element(key)?;
-                state.serialize_element(val)?;
-            }
-            OpResult::Write(key, val) => {
                 state.serialize_element("w")?;
                 state.serialize_element(key)?;
                 state.serialize_element(&Some(val))?;
@@ -116,6 +88,34 @@ impl<'de> Deserialize<'de> for Op {
             }
              _ => Err(serde::de::Error::custom(format!("invalid op type: {rw}"))),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OpResult {
+    Read(u64, Option<u64>),
+    Write(u64, u64),
+}
+
+impl Serialize for OpResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_tuple(3)?;
+        match self {
+            OpResult::Read(key, val) => {
+                state.serialize_element("r")?;
+                state.serialize_element(key)?;
+                state.serialize_element(val)?;
+            }
+            OpResult::Write(key, val) => {
+                state.serialize_element("w")?;
+                state.serialize_element(key)?;
+                state.serialize_element(&Some(val))?;
+            }
+        }
+        state.end()
     }
 }
 
@@ -193,7 +193,6 @@ impl TxnOk {
         _node: &TxnNode,
         _tx: Sender<Message<Body<TxnNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected SendOk message")
     }
 }

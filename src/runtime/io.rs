@@ -1,4 +1,5 @@
 use anyhow::Context;
+use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use std::fmt::Debug;
 use std::io::BufRead;
@@ -11,44 +12,45 @@ use crate::message::{Body, Message, PayloadInit};
 
 use super::node::Node;
 
+enum OutputMessage<P> {
+    Node(Message<Body<P>>),
+    Kv(Message<Body<KvPayload>>),
+    Init(Message<Body<PayloadInit>>),
+}
+
 pub(crate) async fn stdout_writer_loop<N: Node<S, W>, S, W>(
-    mut rx_node: Receiver<Message<Body<N::Payload>>>,
-    mut rx_kv: Receiver<Message<Body<KvPayload>>>,
-    mut rx_init: Receiver<Message<Body<PayloadInit>>>,
+    rx_node: Receiver<Message<Body<N::Payload>>>,
+    rx_kv: Receiver<Message<Body<KvPayload>>>,
+    rx_init: Receiver<Message<Body<PayloadInit>>>,
 ) {
     let mut stdout = tokio::io::stdout();
-    let mut node_running = true;
-    let mut kv_running = true;
-    let mut init_running = true;
 
-    loop {
-        tokio::select! {
-            msg = rx_node.recv(), if node_running => {
-                handle_output(msg, &mut node_running, "node", &mut stdout).await;
-            },
-            msg = rx_kv.recv(), if kv_running => {
-               handle_output(msg, &mut kv_running, "kv", &mut stdout).await;
-            },
-            msg = rx_init.recv(), if init_running => {
-               handle_output(msg, &mut init_running, "init", &mut stdout).await;
-            },
-            else => {
-                break;
-            }
+    let s_node = stream::unfold(rx_node, |mut rx| async move {
+        rx.recv().await.map(|msg| (OutputMessage::Node(msg), rx))
+    });
+    let s_kv = stream::unfold(rx_kv, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|msg| (OutputMessage::<N::Payload>::Kv(msg), rx))
+    });
+    let s_init = stream::unfold(rx_init, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|msg| (OutputMessage::<N::Payload>::Init(msg), rx))
+    });
+
+    let mut stream = std::pin::pin!(stream::select(stream::select(s_node, s_kv), s_init));
+
+    while let Some(msg) = stream.next().await {
+        match msg {
+            OutputMessage::Node(msg) => write_message(msg, "node", &mut stdout).await,
+            OutputMessage::Kv(msg) => write_message(msg, "kv", &mut stdout).await,
+            OutputMessage::Init(msg) => write_message(msg, "init", &mut stdout).await,
         }
     }
 }
 
-async fn handle_output<T: Serialize + Debug>(
-    msg: Option<T>,
-    running: &mut bool,
-    ctx: &str,
-    stdout: &mut tokio::io::Stdout,
-) {
-    let Some(msg) = msg else {
-        *running = false;
-        return;
-    };
+async fn write_message<T: Serialize + Debug>(msg: T, ctx: &str, stdout: &mut tokio::io::Stdout) {
     debug!("sending {ctx} msg {msg:?}");
     match serde_json::to_string(&msg) {
         Ok(mut outbound) => {

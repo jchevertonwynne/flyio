@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use flyio::{Body, Init, Message, MsgIDProvider, Node, Worker, main_loop};
+use futures::stream::{self, StreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -202,7 +203,6 @@ impl BroadcastOk {
         _node: &BroadcastNode,
         _tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected BroadcastOk message")
     }
 }
@@ -263,7 +263,6 @@ impl ReadOk {
         _node: &BroadcastNode,
         _tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected ReadOk message")
     }
 }
@@ -332,7 +331,6 @@ impl TopologyOk {
         _node: &BroadcastNode,
         _tx: Sender<Message<Body<BroadcastNodePayload>>>,
     ) -> anyhow::Result<()> {
-        let _ = self;
         bail!("unexpected TopologyOk message")
     }
 }
@@ -399,19 +397,31 @@ impl Worker<BroadcastNodePayload> for BroadcastNode {
     ) -> anyhow::Result<()> {
         let plan = self.flush_pending().await;
 
-        for (unseen_neighbour, messages) in plan {
-            let msg_id = self.id_provider.id();
-            tx.send(Message {
-                src: self.node_id.clone(),
-                dst: unseen_neighbour,
-                body: Body {
-                    incoming_msg_id: Some(msg_id),
-                    in_reply_to: None,
-                    payload: BroadcastNodePayload::SendMin(SendMin { messages }),
-                },
+        let sends = stream::iter(plan)
+            .map(|(unseen_neighbour, messages)| {
+                let tx = tx.clone();
+                let src = self.node_id.clone();
+                let msg_id = self.id_provider.id();
+                async move {
+                    tx.send(Message {
+                        src,
+                        dst: unseen_neighbour,
+                        body: Body {
+                            incoming_msg_id: Some(msg_id),
+                            in_reply_to: None,
+                            payload: BroadcastNodePayload::SendMin(SendMin { messages }),
+                        },
+                    })
+                    .await
+                    .context("failed to send supplied msg")
+                }
             })
-            .await
-            .context("failed to send supplied msg")?;
+            .buffer_unordered(10)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in sends {
+            result?;
         }
 
         Ok(())
