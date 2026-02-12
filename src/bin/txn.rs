@@ -76,17 +76,15 @@ impl<'de> Deserialize<'de> for Op {
         match rw.as_str() {
             "r" => {
                 if val.is_some() {
-                    return Err(serde::de::Error::custom(
-                        "read op should not have a value",
-                    ));
+                    return Err(serde::de::Error::custom("read op should not have a value"));
                 }
                 Ok(Op::Read(key))
             }
             "w" => {
-                 let v = val.ok_or_else(|| serde::de::Error::custom("write op missing value"))?;
-                 Ok(Op::Write(key, v))
+                let v = val.ok_or_else(|| serde::de::Error::custom("write op missing value"))?;
+                Ok(Op::Write(key, v))
             }
-             _ => Err(serde::de::Error::custom(format!("invalid op type: {rw}"))),
+            _ => Err(serde::de::Error::custom(format!("invalid op type: {rw}"))),
         }
     }
 }
@@ -128,10 +126,11 @@ impl<'de> Deserialize<'de> for OpResult {
         match rw.as_str() {
             "r" => Ok(OpResult::Read(key, val)),
             "w" => {
-                 let value = val.ok_or_else(|| serde::de::Error::custom("write op missing value"))?;
-                 Ok(OpResult::Write(key, value))
+                let value =
+                    val.ok_or_else(|| serde::de::Error::custom("write op missing value"))?;
+                Ok(OpResult::Write(key, value))
             }
-             _ => Err(serde::de::Error::custom(format!("invalid op type: {rw}"))),
+            _ => Err(serde::de::Error::custom(format!("invalid op type: {rw}"))),
         }
     }
 }
@@ -239,11 +238,7 @@ impl TxnNodePayload {
 impl Node<(), ()> for TxnNode {
     type Payload = TxnNodePayload;
 
-    async fn from_init(
-        _init: Init,
-        _: (),
-        id_provider: MsgIDProvider,
-    ) -> anyhow::Result<Self> {
+    async fn from_init(_init: Init, _: (), id_provider: MsgIDProvider) -> anyhow::Result<Self> {
         Ok(TxnNode {
             inner: Arc::new(TxnNodeInner {
                 id_provider,

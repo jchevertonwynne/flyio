@@ -18,5 +18,6 @@ futures-lite = "2.6.1"
 casey = "0.4.2"
 itertools = "0.12"
 async-trait = "0.1"
+moka = { version = "0.12", features = ["sync"] }
 
 

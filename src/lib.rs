@@ -3,7 +3,8 @@ mod message;
 mod runtime;
 
 pub use kv::{
-    KvClient, KvError, KvPayload, LinKvClient, LwwKvClient, MsgIDProvider, SeqKvClient, TsoClient,
+    KvClient, KvClientTimeoutExt, KvError, KvPayload, LinKvClient, LwwKvClient, MsgIDProvider,
+    SeqKvClient, TsoClient, TsoClientTimeoutExt,
 };
 pub use message::{Body, Init, Message, MinBody, PayloadInit};
 pub use runtime::{Node, Worker, main_loop};

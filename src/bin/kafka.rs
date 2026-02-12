@@ -1,12 +1,17 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker, main_loop};
+use flyio::{
+    Body, Init, KvClientTimeoutExt, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker,
+    main_loop,
+};
 use futures::future::try_join_all;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc::Sender};
 use tracing::{error, warn};
+
+const KV_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct Kafka {
@@ -135,7 +140,11 @@ impl Poll {
         let read_futs = offsets.into_iter().map(|(key, offset)| {
             let kv = node.kv.clone();
             async move {
-                match kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                let storage_key = format!("kafka:{key}");
+                match kv
+                    .read_with_timeout::<MessageDetails>(storage_key.as_str(), KV_TIMEOUT)
+                    .await
+                {
                     Ok(details) => {
                         let filtered: Vec<PollOkMessageEntry> = details
                             .messages
@@ -308,7 +317,11 @@ impl ListCommittedOffsets {
         let read_futs = keys.into_iter().map(|key| {
             let kv = kv.clone();
             async move {
-                match kv.read::<MessageDetails>(format!("kafka:{key}")).await {
+                let storage_key = format!("kafka:{key}");
+                match kv
+                    .read_with_timeout::<MessageDetails>(storage_key.as_str(), KV_TIMEOUT)
+                    .await
+                {
                     Ok(val) => Ok((key, val.committed_offset)),
                     Err(KvError::KeyDoesNotExist) => Ok((key, 0)),
                     Err(e) => Err(e),
@@ -382,15 +395,18 @@ impl Error {
 impl Kafka {
     async fn process_send_batch(self, key: String, batch: Vec<PendingSend>) {
         let kv_key = format!("kafka:{key}");
-        let (mut remote, mut create): (MessageDetails, bool) =
-            match self.kv.read(kv_key.clone()).await {
-                Ok(data) => (data, false),
-                Err(KvError::KeyDoesNotExist) => (MessageDetails::default(), true),
-                Err(e) => {
-                    error!("failed to read kv for batch: {e}");
-                    return;
-                }
-            };
+        let (mut remote, mut create): (MessageDetails, bool) = match self
+            .kv
+            .read_with_timeout::<MessageDetails>(kv_key.as_str(), KV_TIMEOUT)
+            .await
+        {
+            Ok(data) => (data, false),
+            Err(KvError::KeyDoesNotExist) => (MessageDetails::default(), true),
+            Err(e) => {
+                error!("failed to read kv for batch: {e}");
+                return;
+            }
+        };
 
         let mut sleep_dur = Duration::from_millis(1);
         let start_offset = loop {
@@ -408,13 +424,23 @@ impl Kafka {
 
             match self
                 .kv
-                .compare_and_swap(kv_key.clone(), &remote, &entry, create)
+                .compare_and_swap_with_timeout(
+                    kv_key.as_str(),
+                    remote.clone(),
+                    entry.clone(),
+                    create,
+                    KV_TIMEOUT,
+                )
                 .await
             {
                 Ok(true) => break entry.next_offset - batch.len() as u64,
                 Ok(false) => {
                     create = false;
-                    remote = match self.kv.read(kv_key.clone()).await {
+                    remote = match self
+                        .kv
+                        .read_with_timeout::<MessageDetails>(kv_key.as_str(), KV_TIMEOUT)
+                        .await
+                    {
                         Ok(data) => data,
                         Err(KvError::KeyDoesNotExist) => MessageDetails::default(),
                         Err(e) => {
@@ -465,7 +491,11 @@ impl Kafka {
 
     async fn commit_offset_for_key(&self, key: String, offset: u64) -> anyhow::Result<()> {
         let key = format!("kafka:{key}");
-        let mut entry = match self.kv.read::<MessageDetails>(key.clone()).await {
+        let mut entry = match self
+            .kv
+            .read_with_timeout::<MessageDetails>(key.as_str(), KV_TIMEOUT)
+            .await
+        {
             Ok(entry) => entry,
             Err(KvError::KeyDoesNotExist) => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -482,12 +512,22 @@ impl Kafka {
 
             match self
                 .kv
-                .compare_and_swap(key.clone(), &entry, &entry_copy, false)
+                .compare_and_swap_with_timeout(
+                    key.as_str(),
+                    entry.clone(),
+                    entry_copy.clone(),
+                    false,
+                    KV_TIMEOUT,
+                )
                 .await
             {
                 Ok(true) | Err(KvError::KeyDoesNotExist) => break 'cas,
                 Ok(false) => {
-                    entry = match self.kv.read(key.clone()).await {
+                    entry = match self
+                        .kv
+                        .read_with_timeout::<MessageDetails>(key.as_str(), KV_TIMEOUT)
+                        .await
+                    {
                         Ok(next) => next,
                         Err(KvError::KeyDoesNotExist) => break 'cas,
                         Err(e) => return Err(e.into()),

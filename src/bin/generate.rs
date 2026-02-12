@@ -93,7 +93,6 @@ impl Node<(), ()> for GenerateNode {
 
         Ok(())
     }
-    
 }
 
 #[tokio::main]

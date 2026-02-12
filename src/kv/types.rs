@@ -1,14 +1,16 @@
-use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use moka::sync::Cache;
 
 use crate::runtime::ServiceSlot;
 
 pub const ERROR_CODE_KEY_NOT_EXIST: u16 = 20;
 pub const ERROR_CODE_PRECONDITION_FAILED: u16 = 22;
 
-pub trait StoreName {
+pub trait StoreName: Send + Sync + 'static {
     fn name() -> &'static str;
 }
 
@@ -40,7 +42,14 @@ impl StoreName for LwwStore {
 pub enum KvError {
     KeyDoesNotExist,
     PreconditionFailed,
-    Other { code: u16, text: String },
+    Other {
+        code: u16,
+        text: String,
+    },
+    Timeout {
+        operation: &'static str,
+        duration: Duration,
+    },
     Internal(anyhow::Error),
 }
 
@@ -50,6 +59,12 @@ impl fmt::Display for KvError {
             KvError::KeyDoesNotExist => write!(f, "key does not exist"),
             KvError::PreconditionFailed => write!(f, "precondition failed"),
             KvError::Other { code, text } => write!(f, "kv error code {code}: {text}"),
+            KvError::Timeout {
+                operation,
+                duration,
+            } => {
+                write!(f, "{operation} timed out after {duration:?}")
+            }
             KvError::Internal(err) => write!(f, "kv internal error: {err}"),
         }
     }
@@ -94,7 +109,7 @@ impl MsgIDProvider {
     #[must_use]
     pub fn with_route_hook(
         &self,
-        routes: Arc<Mutex<HashMap<u64, ServiceSlot>>>,
+        routes: Cache<u64, ServiceSlot>,
         slot: ServiceSlot,
     ) -> MsgIDProvider {
         MsgIDProvider {
@@ -115,19 +130,16 @@ impl MsgIDProvider {
 
 #[derive(Clone)]
 struct RouteHook {
-    routes: Arc<Mutex<HashMap<u64, ServiceSlot>>>,
+    routes: Cache<u64, ServiceSlot>,
     slot: ServiceSlot,
 }
 
 impl RouteHook {
-    fn new(routes: Arc<Mutex<HashMap<u64, ServiceSlot>>>, slot: ServiceSlot) -> Self {
+    fn new(routes: Cache<u64, ServiceSlot>, slot: ServiceSlot) -> Self {
         Self { routes, slot }
     }
 
     fn register(&self, msg_id: u64) {
-        self.routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(msg_id, self.slot);
+        self.routes.insert(msg_id, self.slot);
     }
 }

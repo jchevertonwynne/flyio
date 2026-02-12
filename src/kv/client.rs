@@ -1,12 +1,15 @@
 use anyhow::Context;
+use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, warn};
@@ -94,7 +97,7 @@ pub type SeqKvClient = KvClient<SeqStore>;
 pub type LinKvClient = KvClient<LinStore>;
 pub type LwwKvClient = KvClient<LwwStore>;
 
-impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
+impl<S: StoreName> KvClient<S> {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(
@@ -165,32 +168,14 @@ impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
     }
 
     pub async fn read<T: DeserializeOwned>(&self, key: impl AsRef<str>) -> Result<T, KvError> {
-        let key = key.as_ref().to_string();
-        let (tx, rx) = oneshot::channel();
-        self.worker
-            .send(KvMsg::Read(KvMsgRead { key, tx }))
+        self.read_with_deadline(key.as_ref().to_string(), None)
             .await
-            .map_err(KvError::Internal)?;
-        let val = rx
-            .await
-            .context("failed to receive read response")
-            .map_err(KvError::Internal)??;
-        serde_json::from_value(val).map_err(|err| KvError::Internal(anyhow::Error::new(err)))
     }
 
     pub async fn write<T: Serialize>(&self, key: impl AsRef<str>, value: T) -> Result<(), KvError> {
         let key = key.as_ref().to_string();
-        let (tx, rx) = oneshot::channel();
-        let value = serde_json::to_value(value)
-            .context("failed to serialize value for write")
-            .map_err(KvError::Internal)?;
-        self.worker
-            .send(KvMsg::Write(KvMsgWrite { key, value, tx }))
-            .await
-            .map_err(KvError::Internal)?;
-        rx.await
-            .context("failed to receive write response")
-            .map_err(KvError::Internal)?
+        let value = Self::serialize_value(value, "failed to serialize value for write")?;
+        self.write_with_deadline(key, value, None).await
     }
 
     pub async fn compare_and_swap<T: Serialize>(
@@ -201,13 +186,58 @@ impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
         create_if_not_exists: bool,
     ) -> Result<bool, KvError> {
         let key = key.as_ref().to_string();
+        let from = Self::serialize_value(from, "failed to serialize 'from' value for cas")?;
+        let to = Self::serialize_value(to, "failed to serialize 'to' value for cas")?;
+        self.cas_with_deadline(key, from, to, create_if_not_exists, None)
+            .await
+    }
+
+    fn serialize_value<T: Serialize>(
+        value: T,
+        context: &'static str,
+    ) -> Result<serde_json::Value, KvError> {
+        serde_json::to_value(value)
+            .context(context)
+            .map_err(KvError::Internal)
+    }
+
+    async fn read_with_deadline<T: DeserializeOwned>(
+        &self,
+        key: String,
+        deadline: Option<Duration>,
+    ) -> Result<T, KvError> {
         let (tx, rx) = oneshot::channel();
-        let from = serde_json::to_value(from)
-            .context("failed to serialize 'from' value for cas")
+        self.worker
+            .send(KvMsg::Read(KvMsgRead { key, tx }))
+            .await
             .map_err(KvError::Internal)?;
-        let to = serde_json::to_value(to)
-            .context("failed to serialize 'to' value for cas")
+        let val = await_response_with_timeout(rx, "read", deadline).await?;
+        serde_json::from_value(val).map_err(|err| KvError::Internal(anyhow::Error::new(err)))
+    }
+
+    async fn write_with_deadline(
+        &self,
+        key: String,
+        value: serde_json::Value,
+        deadline: Option<Duration>,
+    ) -> Result<(), KvError> {
+        let (tx, rx) = oneshot::channel();
+        self.worker
+            .send(KvMsg::Write(KvMsgWrite { key, value, tx }))
+            .await
             .map_err(KvError::Internal)?;
+        await_response_with_timeout(rx, "write", deadline).await
+    }
+
+    async fn cas_with_deadline(
+        &self,
+        key: String,
+        from: serde_json::Value,
+        to: serde_json::Value,
+        create_if_not_exists: bool,
+        deadline: Option<Duration>,
+    ) -> Result<bool, KvError> {
+        let (tx, rx) = oneshot::channel();
         self.worker
             .send(KvMsg::CmpAndSwp(KvMsgCmpAndSwp {
                 key,
@@ -218,9 +248,7 @@ impl<S: StoreName + Send + Sync + 'static> KvClient<S> {
             }))
             .await
             .map_err(KvError::Internal)?;
-        rx.await
-            .context("failed to receive cas response")
-            .map_err(KvError::Internal)?
+        await_response_with_timeout(rx, "cas", deadline).await
     }
 
     pub async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
@@ -305,14 +333,16 @@ impl TsoClient {
     }
 
     pub async fn ts(&self) -> Result<u64, KvError> {
+        self.ts_with_deadline(None).await
+    }
+
+    async fn ts_with_deadline(&self, deadline: Option<Duration>) -> Result<u64, KvError> {
         let (tx, rx) = oneshot::channel();
         self.worker
             .send(TsoMsg::Ts(TsoMsgTs { tx }))
             .await
             .map_err(KvError::Internal)?;
-        rx.await
-            .context("failed to receive ts response")
-            .map_err(KvError::Internal)?
+        await_response_with_timeout(rx, "ts", deadline).await
     }
 
     pub async fn process(&self, msg: Message<Body<KvPayload>>) -> anyhow::Result<()> {
@@ -333,6 +363,122 @@ impl TsoClient {
 
     pub async fn stop(&self) {
         self.worker.stop().await;
+    }
+}
+
+async fn await_response_with_timeout<T>(
+    rx: oneshot::Receiver<Result<T, KvError>>,
+    operation: &'static str,
+    deadline: Option<Duration>,
+) -> Result<T, KvError> {
+    let recv_result = if let Some(limit) = deadline {
+        match timeout(limit, rx).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(KvError::Timeout {
+                    operation,
+                    duration: limit,
+                });
+            }
+        }
+    } else {
+        rx.await
+    };
+
+    recv_result
+        .context(format!("failed to receive {operation} response"))
+        .map_err(KvError::Internal)?
+}
+
+#[async_trait]
+#[allow(dead_code)]
+pub trait KvClientTimeoutExt<S: StoreName>: Send + Sync {
+    async fn read_with_timeout<T>(&self, key: &str, timeout: Duration) -> Result<T, KvError>
+    where
+        T: DeserializeOwned + Send;
+
+    async fn write_with_timeout<T>(
+        &self,
+        key: &str,
+        value: T,
+        timeout: Duration,
+    ) -> Result<(), KvError>
+    where
+        T: Serialize + Send;
+
+    async fn compare_and_swap_with_timeout<T>(
+        &self,
+        key: &str,
+        from: T,
+        to: T,
+        create_if_not_exists: bool,
+        timeout: Duration,
+    ) -> Result<bool, KvError>
+    where
+        T: Serialize + Send;
+}
+
+#[async_trait]
+impl<S> KvClientTimeoutExt<S> for KvClient<S>
+where
+    S: StoreName,
+{
+    async fn read_with_timeout<T>(&self, key: &str, timeout: Duration) -> Result<T, KvError>
+    where
+        T: DeserializeOwned + Send,
+    {
+        self.read_with_deadline(key.to_string(), Some(timeout))
+            .await
+    }
+
+    async fn write_with_timeout<T>(
+        &self,
+        key: &str,
+        value: T,
+        timeout: Duration,
+    ) -> Result<(), KvError>
+    where
+        T: Serialize + Send,
+    {
+        let value = Self::serialize_value(value, "failed to serialize value for write")?;
+        self.write_with_deadline(key.to_string(), value, Some(timeout))
+            .await
+    }
+
+    async fn compare_and_swap_with_timeout<T>(
+        &self,
+        key: &str,
+        from: T,
+        to: T,
+        create_if_not_exists: bool,
+        timeout: Duration,
+    ) -> Result<bool, KvError>
+    where
+        T: Serialize + Send,
+    {
+        let from = Self::serialize_value(from, "failed to serialize 'from' value for cas")?;
+        let to = Self::serialize_value(to, "failed to serialize 'to' value for cas")?;
+        self.cas_with_deadline(
+            key.to_string(),
+            from,
+            to,
+            create_if_not_exists,
+            Some(timeout),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+#[allow(dead_code)]
+pub trait TsoClientTimeoutExt: Send + Sync {
+    async fn ts_with_timeout(&self, timeout: Duration) -> Result<u64, KvError>;
+}
+
+#[async_trait]
+impl TsoClientTimeoutExt for TsoClient {
+    async fn ts_with_timeout(&self, timeout: Duration) -> Result<u64, KvError> {
+        self.ts_with_deadline(Some(timeout)).await
     }
 }
 
