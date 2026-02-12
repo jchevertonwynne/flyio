@@ -2,9 +2,8 @@ use std::{ops::Deref, sync::Arc};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MessageSender, MsgIDProvider, Node, main_loop};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 #[derive(Clone)]
@@ -54,11 +53,14 @@ impl Node<(), ()> for GenerateNode {
         })
     }
 
-    async fn handle(
+    async fn handle<T>(
         &self,
         msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<Self::Payload>,
+    {
         let Message {
             src,
             dst,
@@ -86,7 +88,9 @@ impl Node<(), ()> for GenerateNode {
                     },
                 };
 
-                tx.send(response).await.context("channel closed")?;
+                tx.send(response)
+                    .await
+                    .context("failed to send generate response")?;
             }
             GeneratePayload::GenerateOk { .. } => bail!("i should not receive this"),
         }
@@ -100,4 +104,73 @@ async fn main() -> anyhow::Result<()> {
     main_loop::<GenerateNode, (), ()>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use flyio::ChannelSender;
+
+    use super::*;
+
+    fn mk_node() -> GenerateNode {
+        GenerateNode {
+            inner: Arc::new(GenerateNodeInner {
+                node_id: "n2".into(),
+                id_provider: MsgIDProvider::new(),
+            }),
+        }
+    }
+
+    fn mk_message(payload: GeneratePayload) -> Message<Body<GeneratePayload>> {
+        Message {
+            src: "client".into(),
+            dst: "n2".into(),
+            body: Body {
+                incoming_msg_id: Some(5),
+                in_reply_to: None,
+                payload,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_scoped_id_for_generate() {
+        let node = mk_node();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ChannelSender::new(tx);
+
+        node.handle(mk_message(GeneratePayload::Generate), handle)
+            .await
+            .expect("handle should succeed");
+
+        let response = rx.recv().await.expect("response missing");
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match response.body.payload {
+            GeneratePayload::GenerateOk { id } => {
+                assert!(id.starts_with("n2-"));
+                assert_eq!(response.body.in_reply_to, Some(5));
+                assert!(response.body.incoming_msg_id.is_some());
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_generate_ok_payload() {
+        let node = mk_node();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let handle = ChannelSender::new(tx);
+
+        let err = node
+            .handle(
+                mk_message(GeneratePayload::GenerateOk {
+                    id: "n2-123".into(),
+                }),
+                handle,
+            )
+            .await
+            .expect_err("should fail for GenerateOk request");
+
+        assert!(err.to_string().contains("should not receive"));
+    }
 }

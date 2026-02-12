@@ -1,17 +1,17 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, Worker, main_loop};
+use flyio::{Body, Init, Message, MessageSender, MsgIDProvider, Node, Worker, main_loop};
 use futures::stream::{self, StreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     ops::Deref,
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, mpsc::Sender};
-use tracing::error;
+use tokio::sync::Mutex;
+use tracing::{debug, error};
 
 #[derive(Clone)]
 struct BroadcastNode {
@@ -21,88 +21,200 @@ struct BroadcastNode {
 struct BroadcastNodeInner {
     node_id: String,
     id_provider: MsgIDProvider,
-    seen_complete: Mutex<HashSet<u64>>,
-    completed_order: Mutex<VecDeque<u64>>,
-    seen: Mutex<HashMap<u64, String>>,
-    neighbours: Mutex<HashSet<String>>,
+    completed: CompletedMessages,
+    pending: PendingBuffer,
+    neighbours: NeighbourRegistry,
 }
 
 const SEEN_COMPLETE_LIMIT: usize = 10_000;
 
-impl BroadcastNodeInner {
-    async fn snapshot_messages(&self) -> HashSet<u64> {
-        let mut messages = HashSet::new();
-        {
-            let complete = self.seen_complete.lock().await;
-            messages.reserve(complete.len());
-            messages.extend(complete.iter().copied());
+struct CompletedMessages {
+    limit: usize,
+    inner: Mutex<CompletedStorage>,
+}
+
+#[derive(Default)]
+struct CompletedStorage {
+    seen: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl CompletedMessages {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            inner: Mutex::new(CompletedStorage::default()),
         }
-        {
-            let seen = self.seen.lock().await;
-            messages.reserve(seen.len());
-            messages.extend(seen.keys().copied());
-        }
-        messages
     }
 
-    async fn record_completion(&self, message: u64) {
+    async fn snapshot(&self) -> HashSet<u64> {
+        let storage = self.inner.lock().await;
+        storage.seen.iter().copied().collect()
+    }
+
+    async fn record(&self, message: u64) {
+        let mut storage = self.inner.lock().await;
+        if !storage.seen.insert(message) {
+            return;
+        }
+        storage.order.push_back(message);
+        if storage.order.len() > self.limit
+            && let Some(evicted) = storage.order.pop_front()
         {
-            let mut complete = self.seen_complete.lock().await;
-            if !complete.insert(message) {
-                return;
+            storage.seen.remove(&evicted);
+        }
+    }
+
+    async fn filter_new(&self, candidates: Vec<u64>) -> Vec<u64> {
+        let storage = self.inner.lock().await;
+        candidates
+            .into_iter()
+            .filter(|msg| !storage.seen.contains(msg))
+            .collect()
+    }
+}
+
+struct PendingBuffer {
+    entries: Mutex<HashMap<u64, String>>,
+}
+
+impl PendingBuffer {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn queue_from<I>(
+        &self,
+        source: &str,
+        messages: I,
+        completed: &CompletedMessages,
+    ) -> QueueStats
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let incoming: Vec<u64> = messages.into_iter().collect();
+        if incoming.is_empty() {
+            let total = self.entries.lock().await.len();
+            return QueueStats::empty(total);
+        }
+
+        let filtered = completed.filter_new(incoming).await;
+        if filtered.is_empty() {
+            let total = self.entries.lock().await.len();
+            return QueueStats::empty(total);
+        }
+
+        let mut pending = self.entries.lock().await;
+        let mut added = 0;
+        let mut skipped = 0;
+        for msg in filtered {
+            match pending.entry(msg) {
+                Entry::Vacant(slot) => {
+                    slot.insert(source.to_string());
+                    added += 1;
+                }
+                Entry::Occupied(_) => {
+                    skipped += 1;
+                }
             }
         }
 
-        let mut evicted = None;
-        {
-            let mut order = self.completed_order.lock().await;
-            order.push_back(message);
-            if order.len() > SEEN_COMPLETE_LIMIT {
-                evicted = order.pop_front();
-            }
+        QueueStats {
+            added,
+            skipped,
+            total_after: pending.len(),
         }
+    }
 
-        if let Some(evicted_id) = evicted {
-            let mut complete = self.seen_complete.lock().await;
-            complete.remove(&evicted_id);
+    async fn drain(&self) -> Vec<(u64, String)> {
+        let mut pending = self.entries.lock().await;
+        pending.drain().collect()
+    }
+
+    async fn snapshot(&self) -> HashSet<u64> {
+        let pending = self.entries.lock().await;
+        pending.keys().copied().collect()
+    }
+}
+
+struct NeighbourRegistry {
+    nodes: Mutex<HashSet<String>>,
+}
+
+impl NeighbourRegistry {
+    fn new() -> Self {
+        Self {
+            nodes: Mutex::new(HashSet::new()),
         }
+    }
+
+    async fn replace(&self, neighbours: HashSet<String>) -> usize {
+        let mut guard = self.nodes.lock().await;
+        *guard = neighbours;
+        guard.len()
+    }
+
+    async fn snapshot(&self) -> HashSet<String> {
+        self.nodes.lock().await.clone()
+    }
+}
+
+struct QueueStats {
+    added: usize,
+    skipped: usize,
+    total_after: usize,
+}
+
+impl QueueStats {
+    fn empty(total_after: usize) -> Self {
+        Self {
+            added: 0,
+            skipped: 0,
+            total_after,
+        }
+    }
+}
+
+use self::handlers::BroadcastNodePayload;
+
+impl BroadcastNodeInner {
+    async fn snapshot_messages(&self) -> HashSet<u64> {
+        let mut messages = self.completed.snapshot().await;
+        messages.extend(self.pending.snapshot().await);
+        messages
     }
 
     async fn queue_pending_from<I>(&self, source: &str, messages: I)
     where
         I: IntoIterator<Item = u64>,
     {
-        let mut pending: Vec<u64> = messages.into_iter().collect();
-        if pending.is_empty() {
-            return;
-        }
-
-        let filtered: Vec<u64> = {
-            let complete = self.seen_complete.lock().await;
-            pending.retain(|msg| !complete.contains(msg));
-            pending
-        };
-
-        if filtered.is_empty() {
-            return;
-        }
-
-        let mut seen_locked = self.seen.lock().await;
-        for msg in filtered {
-            seen_locked.entry(msg).or_insert_with(|| source.to_string());
+        let stats = self
+            .pending
+            .queue_from(source, messages, &self.completed)
+            .await;
+        if stats.added > 0 {
+            debug!(
+                source,
+                added = stats.added,
+                skipped = stats.skipped,
+                pending = stats.total_after,
+                "queued new broadcast messages"
+            );
         }
     }
 
     async fn flush_pending(&self) -> HashMap<String, HashSet<u64>> {
-        let neighbours = {
-            let neighbours = self.neighbours.lock().await;
-            neighbours.clone()
-        };
+        let neighbours = self.neighbours.snapshot().await;
+        if neighbours.is_empty() {
+            return HashMap::new();
+        }
 
-        let drained: Vec<(u64, String)> = {
-            let mut msgs = self.seen.lock().await;
-            msgs.drain().collect()
-        };
+        let drained = self.pending.drain().await;
+        if drained.is_empty() {
+            return HashMap::new();
+        }
 
         let grouped: HashMap<String, Vec<u64>> = drained
             .into_iter()
@@ -119,11 +231,303 @@ impl BroadcastNodeInner {
                     .extend(msgs.iter().copied());
             }
             for msg in msgs {
-                self.record_completion(msg).await;
+                self.completed.record(msg).await;
             }
         }
 
+        debug!(
+            targets = need_to_send.len(),
+            "prepared broadcast gossip batches"
+        );
         need_to_send
+    }
+}
+
+mod handlers {
+    use super::{
+        Body, BroadcastNode, Context, Deserialize, HashMap, HashSet, Message, MessageSender,
+        Serialize, bail, debug,
+    };
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub(super) enum BroadcastNodePayload {
+        Broadcast(Broadcast),
+        BroadcastOk(BroadcastOk),
+        Read(Read),
+        ReadOk(ReadOk),
+        Topology(Topology),
+        TopologyOk(TopologyOk),
+        SendMin(SendMin),
+    }
+
+    impl BroadcastNodePayload {
+        pub(super) async fn dispatch<T>(
+            self,
+            msg: Message<Body<()>>,
+            node: &BroadcastNode,
+            tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            match self {
+                BroadcastNodePayload::Broadcast(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::BroadcastOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::ReadOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::Topology(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::TopologyOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::SendMin(payload) => payload.handle(msg, node, tx).await,
+            }
+        }
+
+        pub(super) fn from_messages(messages: HashSet<u64>) -> Self {
+            BroadcastNodePayload::SendMin(SendMin { messages })
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub(super) struct Broadcast {
+        message: u64,
+    }
+
+    impl Broadcast {
+        async fn handle<T>(
+            self,
+            msg: Message<Body<()>>,
+            node: &BroadcastNode,
+            tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            let Self { message } = self;
+            let Message {
+                src,
+                dst,
+                body:
+                    Body {
+                        incoming_msg_id,
+                        in_reply_to: _,
+                        payload: (),
+                    },
+            } = msg;
+
+            let resp_msg_id = node.id_provider.id();
+            node.queue_pending_from(&src, [message]).await;
+
+            let response = Message {
+                src: dst,
+                dst: src,
+                body: Body {
+                    incoming_msg_id: Some(resp_msg_id),
+                    in_reply_to: incoming_msg_id,
+                    payload: BroadcastNodePayload::BroadcastOk(BroadcastOk),
+                },
+            };
+
+            tx.send(response)
+                .await
+                .context("failed to send broadcast ack")?;
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct BroadcastOk;
+
+    impl BroadcastOk {
+        #[allow(clippy::unused_async)]
+        async fn handle<T>(
+            self,
+            _msg: Message<Body<()>>,
+            _node: &BroadcastNode,
+            _tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            bail!("unexpected BroadcastOk message")
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct Read;
+
+    impl Read {
+        async fn handle<T>(
+            self,
+            msg: Message<Body<()>>,
+            node: &BroadcastNode,
+            tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            let Message {
+                src,
+                dst,
+                body:
+                    Body {
+                        incoming_msg_id,
+                        in_reply_to: _,
+                        payload: (),
+                    },
+            } = msg;
+
+            let resp_msg_id = node.id_provider.id();
+            let messages = node.snapshot_messages().await;
+
+            debug!(count = messages.len(), "serving broadcast read");
+
+            let response = Message {
+                src: dst,
+                dst: src,
+                body: Body {
+                    incoming_msg_id: Some(resp_msg_id),
+                    in_reply_to: incoming_msg_id,
+                    payload: BroadcastNodePayload::ReadOk(ReadOk { messages }),
+                },
+            };
+
+            tx.send(response)
+                .await
+                .context("failed to send read response")?;
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct ReadOk {
+        messages: HashSet<u64>,
+    }
+
+    impl ReadOk {
+        #[allow(clippy::unused_async)]
+        async fn handle<T>(
+            self,
+            _msg: Message<Body<()>>,
+            _node: &BroadcastNode,
+            _tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            bail!("unexpected ReadOk message")
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct Topology {
+        topology: HashMap<String, HashSet<String>>,
+    }
+
+    impl Topology {
+        async fn handle<T>(
+            self,
+            msg: Message<Body<()>>,
+            node: &BroadcastNode,
+            tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            let Self { mut topology } = self;
+            let Message {
+                src,
+                dst,
+                body:
+                    Body {
+                        incoming_msg_id,
+                        in_reply_to: _,
+                        payload: (),
+                    },
+            } = msg;
+
+            let resp_msg_id = node.id_provider.id();
+            let Some(neighbours) = topology.remove(&node.node_id) else {
+                bail!("malformed topology msg");
+            };
+
+            let installed = node.neighbours.replace(neighbours).await;
+            debug!(installed, "applied broadcast topology update");
+
+            let response = Message {
+                src: dst,
+                dst: src,
+                body: Body {
+                    incoming_msg_id: Some(resp_msg_id),
+                    in_reply_to: incoming_msg_id,
+                    payload: BroadcastNodePayload::TopologyOk(TopologyOk),
+                },
+            };
+
+            tx.send(response)
+                .await
+                .context("failed to send topology ack")?;
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct TopologyOk;
+    impl TopologyOk {
+        #[allow(clippy::unused_async)]
+        async fn handle<T>(
+            self,
+            _msg: Message<Body<()>>,
+            _node: &BroadcastNode,
+            _tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            bail!("unexpected TopologyOk message")
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) struct SendMin {
+        messages: HashSet<u64>,
+    }
+
+    impl SendMin {
+        async fn handle<T>(
+            self,
+            msg: Message<Body<()>>,
+            node: &BroadcastNode,
+            _tx: T,
+        ) -> anyhow::Result<()>
+        where
+            T: MessageSender<BroadcastNodePayload>,
+        {
+            let Self { messages } = self;
+            let Message {
+                src,
+                dst: _,
+                body:
+                    Body {
+                        incoming_msg_id: _,
+                        in_reply_to: _,
+                        payload: (),
+                    },
+            } = msg;
+
+            node.queue_pending_from(&src, messages.into_iter()).await;
+
+            Ok(())
+        }
     }
 }
 
@@ -135,266 +539,13 @@ impl Deref for BroadcastNode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum BroadcastNodePayload {
-    Broadcast(Broadcast),
-    BroadcastOk(BroadcastOk),
-    Read(Read),
-    ReadOk(ReadOk),
-    Topology(Topology),
-    TopologyOk(TopologyOk),
-    SendMin(SendMin),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-struct Broadcast {
-    message: u64,
-}
-
-impl Broadcast {
-    async fn handle(
-        self,
-        msg: Message<Body<()>>,
-        node: &BroadcastNode,
-        tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        let Self { message } = self;
-        let Message {
-            src,
-            dst,
-            body:
-                Body {
-                    incoming_msg_id,
-                    in_reply_to: _,
-                    payload: (),
-                },
-        } = msg;
-
-        let resp_msg_id = node.id_provider.id();
-        node.queue_pending_from(&src, [message]).await;
-
-        let response = Message {
-            src: dst,
-            dst: src,
-            body: Body {
-                incoming_msg_id: Some(resp_msg_id),
-                in_reply_to: incoming_msg_id,
-                payload: BroadcastNodePayload::BroadcastOk(BroadcastOk),
-            },
-        };
-
-        tx.send(response).await.context("channel closed")?;
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct BroadcastOk;
-
-impl BroadcastOk {
-    #[allow(clippy::unused_async)]
-    async fn handle(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &BroadcastNode,
-        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        bail!("unexpected BroadcastOk message")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct Read;
-
-impl Read {
-    async fn handle(
-        self,
-        msg: Message<Body<()>>,
-        node: &BroadcastNode,
-        tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        let Self {} = self;
-        let Message {
-            src,
-            dst,
-            body:
-                Body {
-                    incoming_msg_id,
-                    in_reply_to: _,
-                    payload: (),
-                },
-        } = msg;
-
-        let resp_msg_id = node.id_provider.id();
-        let messages = node.snapshot_messages().await;
-
-        let response = Message {
-            src: dst,
-            dst: src,
-            body: Body {
-                incoming_msg_id: Some(resp_msg_id),
-                in_reply_to: incoming_msg_id,
-                payload: BroadcastNodePayload::ReadOk(ReadOk { messages }),
-            },
-        };
-
-        tx.send(response).await.context("channel closed")?;
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct ReadOk {
-    messages: HashSet<u64>,
-}
-
-impl ReadOk {
-    #[allow(clippy::unused_async)]
-    async fn handle(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &BroadcastNode,
-        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        bail!("unexpected ReadOk message")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct Topology {
-    topology: HashMap<String, HashSet<String>>,
-}
-
-impl Topology {
-    async fn handle(
-        self,
-        msg: Message<Body<()>>,
-        node: &BroadcastNode,
-        tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        let Self { mut topology } = self;
-        let Message {
-            src,
-            dst,
-            body:
-                Body {
-                    incoming_msg_id,
-                    in_reply_to: _,
-                    payload: (),
-                },
-        } = msg;
-
-        let resp_msg_id = node.id_provider.id();
-        let Some(neighbours) = topology.remove(&node.node_id) else {
-            bail!("malformed topology msg");
-        };
-
-        {
-            let mut neighbours_locked = node.neighbours.lock().await;
-            for neighbour in neighbours {
-                neighbours_locked.insert(neighbour);
-            }
-        }
-
-        let response = Message {
-            src: dst,
-            dst: src,
-            body: Body {
-                incoming_msg_id: Some(resp_msg_id),
-                in_reply_to: incoming_msg_id,
-                payload: BroadcastNodePayload::TopologyOk(TopologyOk),
-            },
-        };
-
-        tx.send(response).await.context("channel closed")?;
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct TopologyOk;
-impl TopologyOk {
-    #[allow(clippy::unused_async)]
-    async fn handle(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &BroadcastNode,
-        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        bail!("unexpected TopologyOk message")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct SendMin {
-    messages: HashSet<u64>,
-}
-
-impl SendMin {
-    async fn handle(
-        self,
-        msg: Message<Body<()>>,
-        node: &BroadcastNode,
-        _tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        let Self { messages } = self;
-        let Message {
-            src,
-            dst: _,
-            body:
-                Body {
-                    incoming_msg_id: _,
-                    in_reply_to: _,
-                    payload: (),
-                },
-        } = msg;
-
-        node.queue_pending_from(&src, messages).await;
-
-        Ok(())
-    }
-}
-
-impl BroadcastNodePayload {
-    async fn dispatch(
-        self,
-        msg: Message<Body<()>>,
-        node: &BroadcastNode,
-        tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
-        match self {
-            BroadcastNodePayload::Broadcast(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::BroadcastOk(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::ReadOk(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::Topology(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::TopologyOk(payload) => payload.handle(msg, node, tx).await,
-            BroadcastNodePayload::SendMin(payload) => payload.handle(msg, node, tx).await,
-        }
-    }
-}
-
 #[async_trait]
 impl Worker<BroadcastNodePayload> for BroadcastNode {
     fn tick_interval(&self) -> Option<Duration> {
         Some(Duration::from_millis(100))
     }
 
-    async fn handle_tick(
-        &self,
-        tx: Sender<Message<Body<BroadcastNodePayload>>>,
-    ) -> anyhow::Result<()> {
+    async fn handle_tick<T: MessageSender<BroadcastNodePayload>>(&self, tx: T) -> anyhow::Result<()> {
         let plan = self.flush_pending().await;
 
         let sends = stream::iter(plan)
@@ -409,7 +560,7 @@ impl Worker<BroadcastNodePayload> for BroadcastNode {
                         body: Body {
                             incoming_msg_id: Some(msg_id),
                             in_reply_to: None,
-                            payload: BroadcastNodePayload::SendMin(SendMin { messages }),
+                            payload: BroadcastNodePayload::from_messages(messages),
                         },
                     })
                     .await
@@ -446,19 +597,21 @@ impl Node<(), Self> for BroadcastNode {
             inner: Arc::new(BroadcastNodeInner {
                 node_id,
                 id_provider,
-                completed_order: Mutex::new(VecDeque::new()),
-                seen_complete: Mutex::new(HashSet::new()),
-                seen: Mutex::new(HashMap::new()),
-                neighbours: Mutex::new(HashSet::new()),
+                completed: CompletedMessages::new(SEEN_COMPLETE_LIMIT),
+                pending: PendingBuffer::new(),
+                neighbours: NeighbourRegistry::new(),
             }),
         })
     }
 
-    async fn handle(
+    async fn handle<T>(
         &self,
         msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<Self::Payload>,
+    {
         let Message {
             src,
             dst,

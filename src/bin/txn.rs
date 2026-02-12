@@ -1,10 +1,10 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use flyio::{Body, Init, Message, MsgIDProvider, Node, main_loop};
+use flyio::{Body, Init, Message, MessageSender, MsgIDProvider, Node, main_loop};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc};
-use tokio::sync::{Mutex, mpsc::Sender};
+use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 #[derive(Clone)]
@@ -136,11 +136,11 @@ impl<'de> Deserialize<'de> for OpResult {
 }
 
 impl Txn {
-    async fn handle(
+    async fn handle<T: MessageSender<TxnNodePayload>>(
         self,
         msg: Message<Body<()>>,
         node: &TxnNode,
-        tx: Sender<Message<Body<TxnNodePayload>>>,
+        tx: T,
     ) -> anyhow::Result<()> {
         let Self { txn } = self;
         let Message { src, dst, body } = msg;
@@ -172,7 +172,7 @@ impl Txn {
             },
         };
 
-        tx.send(resp).await.context("channel closed")?;
+        tx.send(resp).await.context("failed to send txn response")?;
 
         Ok(())
     }
@@ -186,11 +186,11 @@ struct TxnOk {
 
 impl TxnOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T: MessageSender<TxnNodePayload>>(
         self,
         _msg: Message<Body<()>>,
         _node: &TxnNode,
-        _tx: Sender<Message<Body<TxnNodePayload>>>,
+        _tx: T,
     ) -> anyhow::Result<()> {
         bail!("unexpected SendOk message")
     }
@@ -205,11 +205,11 @@ struct Error {
 
 impl Error {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T: MessageSender<TxnNodePayload>>(
         self,
         _msg: Message<Body<()>>,
         _node: &TxnNode,
-        _tx: Sender<Message<Body<TxnNodePayload>>>,
+        _tx: T,
     ) -> anyhow::Result<()> {
         let Self { code, text } = self;
         warn!("error payload recieved: code = {code} text = {text}");
@@ -219,11 +219,11 @@ impl Error {
 }
 
 impl TxnNodePayload {
-    async fn dispatch(
+    async fn dispatch<T: MessageSender<TxnNodePayload>>(
         self,
         msg: Message<Body<()>>,
         node: &TxnNode,
-        tx: Sender<Message<Body<TxnNodePayload>>>,
+        tx: T,
     ) -> anyhow::Result<()> {
         use TxnNodePayload::{Error, Txn, TxnOk};
         match self {
@@ -247,10 +247,10 @@ impl Node<(), ()> for TxnNode {
         })
     }
 
-    async fn handle(
+    async fn handle<T: MessageSender<Self::Payload>>(
         &self,
         msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
+        tx: T,
     ) -> anyhow::Result<()> {
         let (payload, message) = msg.replace_payload(());
         payload.dispatch(message, self, tx).await

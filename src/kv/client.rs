@@ -15,6 +15,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, warn};
 
 use crate::message::{Body, Message};
+use crate::runtime::{sender::MessageSender};
 
 use super::messages::{
     KvMsg, KvMsgCmpAndSwp, KvMsgCmpAndSwpResponse, KvMsgErrorResponse, KvMsgRead,
@@ -100,10 +101,10 @@ pub type LwwKvClient = KvClient<LwwStore>;
 impl<S: StoreName> KvClient<S> {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
+    pub fn new<T: MessageSender<KvPayload>>(
         id_provider: MsgIDProvider,
         node_id: String,
-        tx_payload: Sender<Message<Body<KvPayload>>>,
+        tx_payload: T,
     ) -> Self {
         let (tx, rx) = channel::<KvMsg>(1);
         let tm = TaskTracker::new();
@@ -123,12 +124,12 @@ impl<S: StoreName> KvClient<S> {
         }
     }
 
-    async fn worker_loop(
+    async fn worker_loop<T: MessageSender<KvPayload>>(
         mut rx: tokio::sync::mpsc::Receiver<KvMsg>,
         cancel: CancellationToken,
         node_id: String,
         id_provider: MsgIDProvider,
-        mut tx_payload: Sender<Message<Body<KvPayload>>>,
+        tx_payload: T,
     ) {
         let mut waiters = KvWaiters {
             read: HashMap::new(),
@@ -155,7 +156,7 @@ impl<S: StoreName> KvClient<S> {
                         S::name(),
                         &id_provider,
                         &mut waiters,
-                        &mut tx_payload,
+                        tx_payload.clone(),
                     )
                     .dispatch(msg)
                     .await
@@ -281,10 +282,10 @@ pub struct TsoClient {
 
 impl TsoClient {
     #[must_use]
-    pub fn new(
+    pub fn new<T: MessageSender<KvPayload>>(
         id_provider: MsgIDProvider,
         node_id: String,
-        tx_payload: Sender<Message<Body<KvPayload>>>,
+        tx_payload: T,
     ) -> Self {
         let (tx, rx) = channel::<TsoMsg>(1);
         let tm = TaskTracker::new();
@@ -303,12 +304,12 @@ impl TsoClient {
         }
     }
 
-    async fn worker_loop(
+    async fn worker_loop<T: MessageSender<KvPayload>>(
         mut rx: tokio::sync::mpsc::Receiver<TsoMsg>,
         cancel: CancellationToken,
         node_id: String,
         id_provider: MsgIDProvider,
-        mut tx_payload: Sender<Message<Body<KvPayload>>>,
+        tx_payload: T,
     ) {
         let mut waiting_for_ts = HashMap::<u64, oneshot::Sender<Result<u64, KvError>>>::new();
         loop {
@@ -322,7 +323,7 @@ impl TsoClient {
                         node_id: node_id.as_str(),
                         id_provider: &id_provider,
                         waiting_for_ts: &mut waiting_for_ts,
-                        tx_payload: &mut tx_payload,
+                        tx_payload: tx_payload.clone(),
                     };
                     if let Err(err) = msg.handle(&mut handler).await {
                         error!("failed to handle tso message: {err}");
@@ -488,21 +489,21 @@ pub(crate) struct KvWaiters {
     cas: HashMap<u64, oneshot::Sender<Result<bool, KvError>>>,
 }
 
-pub(crate) struct KvHandler<'a> {
+pub(crate) struct KvHandler<'a, T> {
     node_id: &'a str,
     store_name: &'a str,
     id_provider: &'a MsgIDProvider,
     waiters: &'a mut KvWaiters,
-    tx_payload: &'a mut Sender<Message<Body<KvPayload>>>,
+    tx_payload: T,
 }
 
-impl<'a> KvHandler<'a> {
+impl<'a, T: MessageSender<KvPayload>> KvHandler<'a, T> {
     fn new(
         node_id: &'a str,
         store_name: &'a str,
         id_provider: &'a MsgIDProvider,
         waiters: &'a mut KvWaiters,
-        tx_payload: &'a mut Sender<Message<Body<KvPayload>>>,
+        tx_payload: T,
     ) -> Self {
         Self {
             node_id,
@@ -542,7 +543,7 @@ impl<'a> KvHandler<'a> {
 }
 
 impl KvMsg {
-    async fn handle(self, handler: &mut KvHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) -> anyhow::Result<()> {
         match self {
             KvMsg::Read(msg) => msg.handle(handler).await,
             KvMsg::ReadResponse(msg) => {
@@ -568,7 +569,7 @@ impl KvMsg {
 }
 
 impl KvMsgRead {
-    async fn handle(self, handler: &mut KvHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) -> anyhow::Result<()> {
         let msg_id = handler.id_provider.id();
         handler.waiters.read.insert(msg_id, self.tx);
         let waiting_reads = handler.waiters.read.len();
@@ -584,7 +585,7 @@ impl KvMsgRead {
 }
 
 impl KvMsgWrite {
-    async fn handle(self, handler: &mut KvHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) -> anyhow::Result<()> {
         let msg_id = handler.id_provider.id();
         handler.waiters.write.insert(msg_id, self.tx);
         let waiting_writes = handler.waiters.write.len();
@@ -606,7 +607,7 @@ impl KvMsgWrite {
 }
 
 impl KvMsgCmpAndSwp {
-    async fn handle(self, handler: &mut KvHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) -> anyhow::Result<()> {
         let msg_id = handler.id_provider.id();
         handler.waiters.cas.insert(msg_id, self.tx);
         let waiting_cas = handler.waiters.cas.len();
@@ -636,7 +637,7 @@ impl KvMsgCmpAndSwp {
 }
 
 impl KvMsgReadResponse {
-    fn handle(self, handler: &mut KvHandler<'_>) {
+    fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) {
         deliver_response(
             &mut handler.waiters.read,
             self.msg_id,
@@ -647,7 +648,7 @@ impl KvMsgReadResponse {
 }
 
 impl KvMsgWriteResponse {
-    fn handle(self, handler: &mut KvHandler<'_>) {
+     fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) {
         deliver_response(&mut handler.waiters.write, self.msg_id, Ok(()), "write");
         debug!(
             msg_id = self.msg_id,
@@ -658,7 +659,7 @@ impl KvMsgWriteResponse {
 }
 
 impl KvMsgCmpAndSwpResponse {
-    fn handle(self, handler: &mut KvHandler<'_>) {
+    fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) {
         deliver_response(
             &mut handler.waiters.cas,
             self.msg_id,
@@ -675,8 +676,8 @@ impl KvMsgCmpAndSwpResponse {
 }
 
 impl KvMsgErrorResponse {
-    fn handle(self, handler: &mut KvHandler<'_>) {
-        let error = KvHandler::mk_error(self.code, &self.text);
+    fn handle<T: MessageSender<KvPayload>>(self, handler: &mut KvHandler<'_, T>) {
+        let error = KvHandler::<'_, T>::mk_error(self.code, &self.text);
 
         if handler.waiters.read.contains_key(&self.msg_id) {
             deliver_response(
@@ -744,14 +745,14 @@ impl KvMsgErrorResponse {
     }
 }
 
-pub(crate) struct TsoHandler<'a> {
+pub(crate) struct TsoHandler<'a, T> {
     node_id: &'a str,
     id_provider: &'a MsgIDProvider,
     waiting_for_ts: &'a mut HashMap<u64, oneshot::Sender<Result<u64, KvError>>>,
-    tx_payload: &'a mut Sender<Message<Body<KvPayload>>>,
+    tx_payload: T,
 }
 
-impl TsoHandler<'_> {
+impl<T: MessageSender<KvPayload>> TsoHandler<'_, T> {
     fn make_message(&self, payload: KvPayload, msg_id: u64) -> Message<Body<KvPayload>> {
         Message {
             src: self.node_id.to_owned(),
@@ -783,7 +784,7 @@ impl TsoHandler<'_> {
 }
 
 impl TsoMsg {
-    async fn handle(self, handler: &mut TsoHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut TsoHandler<'_, T>) -> anyhow::Result<()> {
         match self {
             TsoMsg::Ts(msg) => msg.handle(handler).await,
             TsoMsg::TsOk(msg) => {
@@ -795,13 +796,13 @@ impl TsoMsg {
 }
 
 impl TsoMsgTs {
-    async fn handle(self, handler: &mut TsoHandler<'_>) -> anyhow::Result<()> {
+    async fn handle<T: MessageSender<KvPayload>>(self, handler: &mut TsoHandler<'_, T>) -> anyhow::Result<()> {
         handler.request_timestamp(self.tx).await
     }
 }
 
 impl TsoMsgTsOk {
-    fn handle(self, handler: &mut TsoHandler<'_>) {
+    fn handle<T: MessageSender<KvPayload>>(self, handler: &mut TsoHandler<'_, T>) {
         handler.deliver_timestamp(self.msg_id, self.ts);
     }
 }

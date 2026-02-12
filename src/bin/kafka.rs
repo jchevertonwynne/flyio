@@ -1,14 +1,14 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use flyio::{
-    Body, Init, KvClientTimeoutExt, KvError, LinKvClient, Message, MsgIDProvider, Node, Worker,
-    main_loop,
+    Body, Init, KvClientTimeoutExt, KvError, LinKvClient, Message, MessageSender, MsgIDProvider,
+    Node, Worker, main_loop,
 };
 use futures::future::try_join_all;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, mpsc::Sender};
+use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 const KV_TIMEOUT: Duration = Duration::from_millis(250);
@@ -20,7 +20,6 @@ struct Kafka {
 
 struct KafkaNodeInner {
     id_provider: MsgIDProvider,
-
     kv: LinKvClient,
     state: Mutex<State>,
 }
@@ -33,7 +32,6 @@ struct State {
 struct PendingSend {
     msg: u64,
     client_msg: Message<Body<()>>,
-    tx: Sender<Message<Body<KafkaNodePayload>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -79,17 +77,19 @@ struct Send {
 }
 
 impl Send {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
-        tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let Self { key, msg: val } = self;
         let pending = PendingSend {
             msg: val,
             client_msg: msg,
-            tx,
         };
 
         let mut state = node.state.lock().await;
@@ -106,13 +106,15 @@ struct SendOk {
 }
 
 impl SendOk {
-    #[allow(clippy::unused_async)]
-    async fn handle(
+    fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &Kafka,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         bail!("unexpected SendOk message")
     }
 }
@@ -124,12 +126,15 @@ struct Poll {
 }
 
 impl Poll {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
-        tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let Message { src, dst, body } = msg;
         let Body {
             incoming_msg_id,
@@ -182,7 +187,9 @@ impl Poll {
                 payload: KafkaNodePayload::PollOk(PollOk { msgs: result }),
             },
         };
-        tx.send(response).await.context("channel closed")?;
+        tx.send(response)
+            .await
+            .context("failed to send poll response")?;
 
         Ok(())
     }
@@ -224,12 +231,15 @@ impl<'de> Deserialize<'de> for PollOkMessageEntry {
 
 impl PollOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &Kafka,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         bail!("unexpected PollOk message")
     }
 }
@@ -241,12 +251,15 @@ struct CommitOffsets {
 }
 
 impl CommitOffsets {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
-        tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let Message { src, dst, body } = msg;
         let Body {
             incoming_msg_id,
@@ -271,7 +284,9 @@ impl CommitOffsets {
                 payload: KafkaNodePayload::CommitOffsetsOk(CommitOffsetsOk),
             },
         };
-        tx.send(response).await.context("channel closed")?;
+        tx.send(response)
+            .await
+            .context("failed to send commit response")?;
 
         Ok(())
     }
@@ -283,12 +298,15 @@ struct CommitOffsetsOk;
 
 impl CommitOffsetsOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &Kafka,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         bail!("unexpected CommitOffsetsOk message")
     }
 }
@@ -300,12 +318,15 @@ struct ListCommittedOffsets {
 }
 
 impl ListCommittedOffsets {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
-        tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let Message { src, dst, body } = msg;
         let Body {
             incoming_msg_id,
@@ -346,7 +367,9 @@ impl ListCommittedOffsets {
                 }),
             },
         };
-        tx.send(response).await.context("channel closed")?;
+        tx.send(response)
+            .await
+            .context("failed to send committed offsets")?;
 
         Ok(())
     }
@@ -360,12 +383,15 @@ struct ListCommittedOffsetsOk {
 
 impl ListCommittedOffsetsOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &Kafka,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         bail!("unexpected ListCommittedOffsetsOk message")
     }
 }
@@ -379,12 +405,15 @@ struct Error {
 
 impl Error {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &Kafka,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let Self { code, text } = self;
         warn!("error payload recieved: code = {code} text = {text}");
 
@@ -393,7 +422,14 @@ impl Error {
 }
 
 impl Kafka {
-    async fn process_send_batch(self, key: String, batch: Vec<PendingSend>) {
+    async fn process_send_batch<T>(
+        self,
+        key: String,
+        batch: Vec<PendingSend>,
+        tx: T,
+    ) where
+        T: MessageSender<KafkaNodePayload>,
+    {
         let kv_key = format!("kafka:{key}");
         let (mut remote, mut create): (MessageDetails, bool) = match self
             .kv
@@ -483,8 +519,8 @@ impl Kafka {
                 },
             };
 
-            if let Err(e) = pending.tx.send(response).await {
-                warn!("failed to send batch response: {e}");
+            if let Err(err) = tx.send(response).await {
+                warn!("failed to send batch response: {err}");
             }
         }
     }
@@ -545,19 +581,22 @@ impl Kafka {
 }
 
 impl KafkaNodePayload {
-    async fn dispatch(
+    async fn dispatch<T>(
         self,
         msg: Message<Body<()>>,
         node: &Kafka,
-        tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<KafkaNodePayload>,
+    {
         use KafkaNodePayload::{
             CommitOffsets, CommitOffsetsOk, Error, ListCommittedOffsets, ListCommittedOffsetsOk,
             Poll, PollOk, Send, SendOk,
         };
         match self {
             Send(payload) => payload.handle(msg, node, tx).await,
-            SendOk(payload) => payload.handle(msg, node, tx).await,
+            SendOk(payload) => payload.handle(msg, node, tx),
             Poll(payload) => payload.handle(msg, node, tx).await,
             PollOk(payload) => payload.handle(msg, node, tx).await,
             CommitOffsets(payload) => payload.handle(msg, node, tx).await,
@@ -575,10 +614,7 @@ impl Worker<KafkaNodePayload> for Kafka {
         Some(Duration::from_millis(100))
     }
 
-    async fn handle_tick(
-        &self,
-        _tx: Sender<Message<Body<KafkaNodePayload>>>,
-    ) -> anyhow::Result<()> {
+    async fn handle_tick<T: MessageSender<KafkaNodePayload>>(&self, tx: T) -> anyhow::Result<()> {
         let mut sends = HashMap::new();
         {
             let mut state = self.inner.state.lock().await;
@@ -587,8 +623,9 @@ impl Worker<KafkaNodePayload> for Kafka {
 
         for (key, batch) in sends {
             let node = self.clone();
+            let tx = tx.clone();
             tokio::spawn(async move {
-                node.process_send_batch(key, batch).await;
+                node.process_send_batch(key, batch, tx).await;
             });
         }
 
@@ -614,10 +651,10 @@ impl Node<LinKvClient, Self> for Kafka {
         })
     }
 
-    async fn handle(
+    async fn handle<T: MessageSender<KafkaNodePayload>>(
         &self,
         msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
+        tx: T,
     ) -> anyhow::Result<()> {
         let (payload, message) = msg.replace_payload(());
         payload.dispatch(message, self, tx).await

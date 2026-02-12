@@ -7,4 +7,5 @@ pub use kv::{
     SeqKvClient, TsoClient, TsoClientTimeoutExt,
 };
 pub use message::{Body, Init, Message, MinBody, PayloadInit};
-pub use runtime::{Node, Worker, main_loop};
+pub use runtime::{ChannelSender, CollectSender, Node, Worker, main_loop};
+pub use runtime::sender::MessageSender;

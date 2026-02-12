@@ -1,11 +1,13 @@
 mod io;
 mod node;
 mod routes;
+pub mod sender;
 mod service;
 mod worker;
 
 pub use node::Node;
 pub use routes::ServiceSlot;
+pub use sender::{ChannelSender, CollectSender};
 pub use service::Service;
 pub use worker::Worker;
 
@@ -51,16 +53,25 @@ where
     let (tx_node, rx_node) = channel::<Message<Body<N::Payload>>>(1);
     let (tx_kv, rx_kv) = channel::<Message<Body<KvPayload>>>(1);
     let (tx_init, rx_init) = channel::<Message<Body<PayloadInit>>>(1);
+    let node_sender = ChannelSender::new(tx_node.clone());
+    let kv_sender = ChannelSender::new(tx_kv.clone());
+    let init_sender = ChannelSender::new(tx_init.clone());
     let id_provider = MsgIDProvider::new();
     let routes = RouteRegistry::new();
 
     let writer_handle = tokio::spawn(stdout_writer_loop::<N, S, W>(rx_node, rx_kv, rx_init));
 
-    let (node, services, buffered) = select! {
+    let (node, services, buffered): (N, S, Vec<String>) = select! {
         _ = &mut shutdown => {
             return Ok(())
         }
-        res = handle_init::<N, S, W>(&mut stdin, id_provider, tx_kv, tx_init, routes.clone()) => {
+        res = handle_init::<N, S, W, _, _>(
+            &mut stdin,
+            id_provider,
+            kv_sender.clone(),
+            init_sender.clone(),
+            routes.clone(),
+        ) => {
             res?
         }
     };
@@ -71,13 +82,15 @@ where
     if let Some(worker) = node.get_worker()
         && let Some(period) = worker.tick_interval()
     {
-        let tx_clone = tx_node.clone();
+        let tx_clone = node_sender.clone();
         let cancel = tick_cancel.clone();
         set.spawn(run_node_ticks(worker, tx_clone, cancel, period));
     }
 
     for line in buffered {
-        if let Err(err) = process_line(line, &services, &node, &tx_node, &routes, &mut set).await {
+        let node_sender = node_sender.clone();
+        if let Err(err) = process_line(line, &services, &node, node_sender, &routes, &mut set).await
+        {
             error!("failed to process buffered init message: {err}");
         }
     }
@@ -94,7 +107,8 @@ where
                 };
                 let line = line.context("stdin recv returned error before JSON parsing")?;
 
-                 if let Err(err) = process_line(line, &services, &node, &tx_node, &routes, &mut set).await {
+                let node_sender = node_sender.clone();
+                if let Err(err) = process_line(line, &services, &node, node_sender, &routes, &mut set).await {
                      error!("failed to process inbound message: {err}");
                 }
             }

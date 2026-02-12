@@ -4,9 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::mpsc::Sender;
 
-use crate::message::{Body, Message};
+use crate::runtime::sender::MessageSender;
 
 #[async_trait]
 pub trait Worker<P: Send + 'static>: Clone + Send + Sync + 'static {
@@ -14,7 +13,7 @@ pub trait Worker<P: Send + 'static>: Clone + Send + Sync + 'static {
         None
     }
 
-    async fn handle_tick(&self, _tx: Sender<Message<Body<P>>>) -> anyhow::Result<()> {
+    async fn handle_tick<T: MessageSender<P>>(&self, _tx: T) -> anyhow::Result<()> {
         Ok(())
     }
 }

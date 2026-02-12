@@ -6,7 +6,7 @@ use serde_json::value::RawValue;
 use std::fmt::Debug;
 use std::time::Duration;
 use tokio::select;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,7 @@ use crate::kv::{KvPayload, MsgIDProvider};
 use crate::message::{Body, Init, Message, MinBody, PayloadInit};
 
 use super::routes::{RouteRegistry, ServiceSlot};
+use super::sender::MessageSender;
 use super::service::Service;
 use super::worker::Worker;
 
@@ -25,22 +26,20 @@ pub trait Node<S, W>: Clone + Sized + Send + Sync + 'static {
 
     async fn from_init(init: Init, service: S, id_provider: MsgIDProvider) -> anyhow::Result<Self>;
 
-    async fn handle(
-        &self,
-        msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()>;
+    async fn handle<T>(&self, msg: Message<Body<Self::Payload>>, tx: T) -> anyhow::Result<()>
+    where
+        T: MessageSender<Self::Payload>;
 
     fn get_worker(&self) -> Option<W> {
         None
     }
 }
 
-pub(crate) async fn process_line<N, S, W>(
+pub(crate) async fn process_line<N, S, W, T>(
     line: String,
     services: &S,
     node: &N,
-    tx_node: &Sender<Message<Body<N::Payload>>>,
+    tx_node: T,
     routes: &RouteRegistry,
     set: &mut JoinSet<()>,
 ) -> anyhow::Result<()>
@@ -48,6 +47,7 @@ where
     N: Node<S, W>,
     S: Service,
     W: Worker<N::Payload>,
+    T: MessageSender<N::Payload>,
 {
     let (msg, min_body) = parse_envelope(line.as_str())?;
     let Some(msg) = handle_service_message(msg, &min_body, services, routes).await? else {
@@ -67,14 +67,15 @@ where
     Ok(())
 }
 
-pub(crate) async fn handle_node_message<N, S, W>(
+pub(crate) async fn handle_node_message<N, S, W, T>(
     msg: Message<Body<N::Payload>>,
     node: N,
-    tx: Sender<Message<Body<N::Payload>>>,
+    tx: T,
 ) where
     N: Node<S, W>,
     S: Service,
     W: Worker<N::Payload>,
+    T: MessageSender<N::Payload>,
 {
     debug!("handling msg {msg:?}");
     let resp = node.handle(msg, tx).await;
@@ -83,17 +84,19 @@ pub(crate) async fn handle_node_message<N, S, W>(
     }
 }
 
-pub(crate) async fn handle_init<N, S, W>(
+pub(crate) async fn handle_init<N, S, W, T, U>(
     rx_stdin: &mut Receiver<anyhow::Result<String>>,
     id_provider: MsgIDProvider,
-    tx_kv: Sender<Message<Body<KvPayload>>>,
-    tx_init: Sender<Message<Body<PayloadInit>>>,
+    tx_kv: T,
+    tx_init: U,
     routes: RouteRegistry,
 ) -> Result<(N, S, Vec<String>), anyhow::Error>
 where
     N: Node<S, W>,
     S: Service,
     W: Worker<N::Payload>,
+    T: MessageSender<KvPayload>,
+    U: MessageSender<PayloadInit>,
 {
     let line = rx_stdin
         .recv()
@@ -212,14 +215,15 @@ fn parse_envelope<'a>(line: &'a str) -> anyhow::Result<(Message<&'a RawValue>, M
     Ok((msg, min_body))
 }
 
-pub(crate) async fn run_node_ticks<W, P>(
+pub(crate) async fn run_node_ticks<W, P, T>(
     worker: W,
-    tx: Sender<Message<Body<P>>>,
+    tx: T,
     cancel: CancellationToken,
     period: Duration,
 ) where
     P: Send + 'static,
     W: Worker<P>,
+    T: MessageSender<P>
 {
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);

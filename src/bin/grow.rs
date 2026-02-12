@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use flyio::{
-    Body, Init, KvClientTimeoutExt, Message, MsgIDProvider, Node, SeqKvClient, Worker, main_loop,
+    Body, Init, KvClientTimeoutExt, Message, MessageSender, MsgIDProvider, Node,
+    SeqKvClient, Worker, main_loop,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,7 +13,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, warn};
 
 const COUNTER_KEY: &str = "shared_counter";
@@ -89,12 +89,15 @@ struct Add {
 }
 
 impl Add {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         let Self { delta: message } = self;
         let Message {
             src,
@@ -121,7 +124,7 @@ impl Add {
             },
         };
 
-        tx.send(response).await.context("channel closed")?;
+        tx.send(response).await.context("failed to send add ack")?;
 
         Ok(())
     }
@@ -133,12 +136,15 @@ struct AddOk;
 
 impl AddOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &GrowNode,
-        _tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         bail!("unexpected AddOk message")
     }
 }
@@ -148,12 +154,15 @@ impl AddOk {
 struct Read;
 
 impl Read {
-    async fn handle(
+    async fn handle<T>(
         self,
         msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         let Message {
             src,
             dst,
@@ -197,7 +206,9 @@ impl Read {
             },
         };
 
-        tx.send(response).await.context("channel closed")?;
+        tx.send(response)
+            .await
+            .context("failed to send read response")?;
 
         Ok(())
     }
@@ -211,12 +222,15 @@ struct ReadOk {
 
 impl ReadOk {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &GrowNode,
-        _tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         bail!("unexpected ReadOk message")
     }
 }
@@ -230,12 +244,15 @@ struct Error {
 
 impl Error {
     #[allow(clippy::unused_async)]
-    async fn handle(
+    async fn handle<T>(
         self,
         _msg: Message<Body<()>>,
         _node: &GrowNode,
-        _tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        _tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         let Self { code, text } = self;
         warn!("error payload recieved: code = {code} text = {text}");
 
@@ -244,12 +261,15 @@ impl Error {
 }
 
 impl GrowNodePayload {
-    async fn dispatch(
+    async fn dispatch<T>(
         self,
         msg: Message<Body<()>>,
         node: &GrowNode,
-        tx: Sender<Message<Body<GrowNodePayload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<GrowNodePayload>,
+    {
         match self {
             GrowNodePayload::Add(payload) => payload.handle(msg, node, tx).await,
             GrowNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
@@ -266,7 +286,7 @@ impl Worker<GrowNodePayload> for GrowNode {
         Some(Duration::from_millis(100))
     }
 
-    async fn handle_tick(&self, _tx: Sender<Message<Body<GrowNodePayload>>>) -> anyhow::Result<()> {
+    async fn handle_tick<T: MessageSender<GrowNodePayload>>(&self, _tx: T) -> anyhow::Result<()> {
         if self.propogate.load(Ordering::SeqCst) > 0 {
             self.flush_pending().await?;
         }
@@ -303,11 +323,14 @@ impl Node<SeqKvClient, Self> for GrowNode {
         })
     }
 
-    async fn handle(
+    async fn handle<T>(
         &self,
         msg: Message<Body<Self::Payload>>,
-        tx: Sender<Message<Body<Self::Payload>>>,
-    ) -> anyhow::Result<()> {
+        tx: T,
+    ) -> anyhow::Result<()>
+    where
+        T: MessageSender<Self::Payload>,
+    {
         let (payload, message) = msg.replace_payload(());
         payload.dispatch(message, self, tx).await
     }
@@ -322,4 +345,91 @@ async fn main() -> anyhow::Result<()> {
     main_loop::<GrowNode, SeqKvClient, GrowNode>()
         .await
         .inspect_err(|err| error!("failed to run main: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flyio::{ChannelSender, KvPayload};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk_node() -> GrowNode {
+        let (tx_payload, mut rx_payload) =
+            tokio::sync::mpsc::channel::<Message<Body<KvPayload>>>(8);
+        tokio::spawn(async move { while rx_payload.recv().await.is_some() {} });
+        let tx_payload = ChannelSender::new(tx_payload);
+
+        GrowNode {
+            inner: Arc::new(GrowNodeInner {
+                node_id: "n1".into(),
+                id_provider: MsgIDProvider::new(),
+                propogate: AtomicU64::new(0),
+                kv: SeqKvClient::new(MsgIDProvider::new(), "n1".into(), tx_payload),
+            }),
+        }
+    }
+
+    fn mk_message(incoming_msg_id: Option<u64>) -> Message<Body<()>> {
+        Message {
+            src: "client".into(),
+            dst: "n1".into(),
+            body: Body {
+                incoming_msg_id,
+                in_reply_to: None,
+                payload: (),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn add_handler_accumulates_and_responds() {
+        let node = mk_node();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = ChannelSender::new(tx);
+
+        Add { delta: 7 }
+            .handle(mk_message(Some(99)), &node, handle)
+            .await
+            .expect("add handler should succeed");
+
+        assert_eq!(node.propogate.load(Ordering::SeqCst), 7);
+
+        let response = rx.recv().await.expect("missing response");
+        match response.body.payload {
+            GrowNodePayload::AddOk(_) => {
+                assert_eq!(response.body.in_reply_to, Some(99));
+                assert!(response.body.incoming_msg_id.is_some());
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+
+        node.kv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn flush_pending_is_noop_when_no_delta() {
+        let node = mk_node();
+
+        node.flush_pending()
+            .await
+            .expect("flush should return early when no pending delta");
+
+        assert_eq!(node.propogate.load(Ordering::SeqCst), 0);
+        node.kv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn add_ok_handler_is_unexpected() {
+        let node = mk_node();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let handle = ChannelSender::new(tx);
+
+        let err = AddOk
+            .handle(mk_message(Some(5)), &node, handle)
+            .await
+            .expect_err("AddOk handler should error on inbound message");
+
+        assert!(err.to_string().contains("unexpected AddOk"));
+        node.kv.stop().await;
+    }
 }

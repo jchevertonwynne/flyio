@@ -1,17 +1,17 @@
 use anyhow::bail;
 use std::future::Future;
-use tokio::sync::mpsc::Sender;
 
 use crate::kv::{KvClient, KvPayload, MsgIDProvider, StoreName, TsoClient};
 use crate::message::{Body, Message};
+use crate::runtime::sender::MessageSender;
 
 use super::routes::{RouteRegistry, ServiceSlot};
 
 pub trait Service: Sized + Send + Sync + Clone + 'static {
-    fn init(
+    fn init<T: MessageSender<KvPayload>>(
         id_provider: MsgIDProvider,
         node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
+        tx: T,
         routes: RouteRegistry,
         slot: ServiceSlot,
     ) -> Self;
@@ -33,10 +33,10 @@ pub trait Service: Sized + Send + Sync + Clone + 'static {
 }
 
 impl Service for () {
-    fn init(
+    fn init<T: MessageSender<KvPayload>>(
         _id_provider: MsgIDProvider,
         _node_id: String,
-        _tx: Sender<Message<Body<KvPayload>>>,
+        _tx: T,
         _routes: RouteRegistry,
         _slot: ServiceSlot,
     ) -> Self {
@@ -50,10 +50,10 @@ impl Service for () {
 }
 
 impl<S: StoreName + Send + Sync + Clone + 'static> Service for KvClient<S> {
-    fn init(
+    fn init<T: MessageSender<KvPayload>>(
         id_provider: MsgIDProvider,
         node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
+        tx: T,
         routes: RouteRegistry,
         slot: ServiceSlot,
     ) -> Self {
@@ -71,10 +71,10 @@ impl<S: StoreName + Send + Sync + Clone + 'static> Service for KvClient<S> {
 }
 
 impl Service for TsoClient {
-    fn init(
+    fn init<T: MessageSender<KvPayload>>(
         id_provider: MsgIDProvider,
         node_id: String,
-        tx: Sender<Message<Body<KvPayload>>>,
+        tx: T,
         routes: RouteRegistry,
         slot: ServiceSlot,
     ) -> Self {
@@ -109,10 +109,10 @@ macro_rules! tuple_dispatch_chain {
 macro_rules! impl_service_for_tuple {
     ( $( $name:ident ),+ ) => {
         impl<$( $name: Service ),+> Service for ( $( $name, )+ ) {
-            fn init(
+            fn init<T: MessageSender<KvPayload>>(
                 id_provider: MsgIDProvider,
                 node_id: String,
-                tx: Sender<Message<Body<KvPayload>>>,
+                tx: T,
                 routes: RouteRegistry,
                 slot: ServiceSlot,
             ) -> Self {
