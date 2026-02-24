@@ -184,18 +184,6 @@ struct TxnOk {
     txn: Vec<OpResult>,
 }
 
-impl TxnOk {
-    #[allow(clippy::unused_async)]
-    async fn handle<T: MessageSender<TxnNodePayload>>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &TxnNode,
-        _tx: T,
-    ) -> anyhow::Result<()> {
-        bail!("unexpected SendOk message")
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct Error {
@@ -228,7 +216,7 @@ impl TxnNodePayload {
         use TxnNodePayload::{Error, Txn, TxnOk};
         match self {
             Txn(payload) => payload.handle(msg, node, tx).await,
-            TxnOk(payload) => payload.handle(msg, node, tx).await,
+            TxnOk(_) => bail!("unexpected TxnOk message"),
             Error(payload) => payload.handle(msg, node, tx).await,
         }
     }

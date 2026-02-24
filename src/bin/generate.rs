@@ -53,11 +53,7 @@ impl Node<(), ()> for GenerateNode {
         })
     }
 
-    async fn handle<T>(
-        &self,
-        msg: Message<Body<Self::Payload>>,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(&self, msg: Message<Body<Self::Payload>>, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<Self::Payload>,
     {
@@ -108,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use flyio::ChannelSender;
+    use flyio::CollectSender;
 
     use super::*;
 
@@ -136,14 +132,14 @@ mod tests {
     #[tokio::test]
     async fn returns_scoped_id_for_generate() {
         let node = mk_node();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let handle = ChannelSender::new(tx);
+        let handle = CollectSender::default();
 
-        node.handle(mk_message(GeneratePayload::Generate), handle)
+        node.handle(mk_message(GeneratePayload::Generate), handle.clone())
             .await
             .expect("handle should succeed");
 
-        let response = rx.recv().await.expect("response missing");
+        let mut responses = handle.drain().await;
+        let response = responses.pop().expect("response missing");
         #[allow(clippy::match_wildcard_for_single_variants)]
         match response.body.payload {
             GeneratePayload::GenerateOk { id } => {
@@ -158,8 +154,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_generate_ok_payload() {
         let node = mk_node();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let handle = ChannelSender::new(tx);
+        let handle = CollectSender::default();
 
         let err = node
             .handle(

@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flyio::{ChannelSender, MsgIDProvider};
+    use flyio::{CollectSender, MsgIDProvider};
 
     fn mk_node() -> EchoNode {
         EchoNode {
@@ -96,14 +96,17 @@ mod tests {
     #[tokio::test]
     async fn echoes_back_with_same_payload() {
         let node = mk_node();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let handle = ChannelSender::new(tx);
+        let handle = CollectSender::default();
 
-        node.handle(mk_message(EchoPayload::Echo { echo: "hi".into() }), handle)
-            .await
-            .expect("handle should succeed");
+        node.handle(
+            mk_message(EchoPayload::Echo { echo: "hi".into() }),
+            handle.clone(),
+        )
+        .await
+        .expect("handle should succeed");
 
-        let response = rx.recv().await.expect("response missing");
+        let mut responses = handle.drain().await;
+        let response = responses.pop().expect("response missing");
         #[allow(clippy::match_wildcard_for_single_variants)]
         match response.body.payload {
             EchoPayload::EchoOk { echo } => {
@@ -118,8 +121,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_echo_ok_payload() {
         let node = mk_node();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let handle = ChannelSender::new(tx);
+        let handle = CollectSender::default();
 
         let err = node
             .handle(

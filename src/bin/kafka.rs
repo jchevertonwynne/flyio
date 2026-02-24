@@ -77,12 +77,7 @@ struct Send {
 }
 
 impl Send {
-    async fn handle<T>(
-        self,
-        msg: Message<Body<()>>,
-        node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(self, msg: Message<Body<()>>, node: &Kafka, _tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -105,19 +100,7 @@ struct SendOk {
     offset: u64,
 }
 
-impl SendOk {
-    fn handle<T>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
-    where
-        T: MessageSender<KafkaNodePayload>,
-    {
-        bail!("unexpected SendOk message")
-    }
-}
+impl SendOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,12 +109,7 @@ struct Poll {
 }
 
 impl Poll {
-    async fn handle<T>(
-        self,
-        msg: Message<Body<()>>,
-        node: &Kafka,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(self, msg: Message<Body<()>>, node: &Kafka, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -229,20 +207,7 @@ impl<'de> Deserialize<'de> for PollOkMessageEntry {
     }
 }
 
-impl PollOk {
-    #[allow(clippy::unused_async)]
-    async fn handle<T>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
-    where
-        T: MessageSender<KafkaNodePayload>,
-    {
-        bail!("unexpected PollOk message")
-    }
-}
+impl PollOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,12 +216,7 @@ struct CommitOffsets {
 }
 
 impl CommitOffsets {
-    async fn handle<T>(
-        self,
-        msg: Message<Body<()>>,
-        node: &Kafka,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(self, msg: Message<Body<()>>, node: &Kafka, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -296,20 +256,7 @@ impl CommitOffsets {
 #[serde(rename_all = "snake_case")]
 struct CommitOffsetsOk;
 
-impl CommitOffsetsOk {
-    #[allow(clippy::unused_async)]
-    async fn handle<T>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
-    where
-        T: MessageSender<KafkaNodePayload>,
-    {
-        bail!("unexpected CommitOffsetsOk message")
-    }
-}
+impl CommitOffsetsOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -318,12 +265,7 @@ struct ListCommittedOffsets {
 }
 
 impl ListCommittedOffsets {
-    async fn handle<T>(
-        self,
-        msg: Message<Body<()>>,
-        node: &Kafka,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(self, msg: Message<Body<()>>, node: &Kafka, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -381,20 +323,7 @@ struct ListCommittedOffsetsOk {
     offsets: HashMap<String, u64>,
 }
 
-impl ListCommittedOffsetsOk {
-    #[allow(clippy::unused_async)]
-    async fn handle<T>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
-    where
-        T: MessageSender<KafkaNodePayload>,
-    {
-        bail!("unexpected ListCommittedOffsetsOk message")
-    }
-}
+impl ListCommittedOffsetsOk {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -405,12 +334,7 @@ struct Error {
 
 impl Error {
     #[allow(clippy::unused_async)]
-    async fn handle<T>(
-        self,
-        _msg: Message<Body<()>>,
-        _node: &Kafka,
-        _tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(self, _msg: Message<Body<()>>, _node: &Kafka, _tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -422,12 +346,8 @@ impl Error {
 }
 
 impl Kafka {
-    async fn process_send_batch<T>(
-        self,
-        key: String,
-        batch: Vec<PendingSend>,
-        tx: T,
-    ) where
+    async fn process_send_batch<T>(self, key: String, batch: Vec<PendingSend>, tx: T)
+    where
         T: MessageSender<KafkaNodePayload>,
     {
         let kv_key = format!("kafka:{key}");
@@ -581,12 +501,7 @@ impl Kafka {
 }
 
 impl KafkaNodePayload {
-    async fn dispatch<T>(
-        self,
-        msg: Message<Body<()>>,
-        node: &Kafka,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn dispatch<T>(self, msg: Message<Body<()>>, node: &Kafka, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<KafkaNodePayload>,
     {
@@ -596,13 +511,15 @@ impl KafkaNodePayload {
         };
         match self {
             Send(payload) => payload.handle(msg, node, tx).await,
-            SendOk(payload) => payload.handle(msg, node, tx),
+            SendOk(_) => bail!("unexpected SendOk message"),
             Poll(payload) => payload.handle(msg, node, tx).await,
-            PollOk(payload) => payload.handle(msg, node, tx).await,
+            PollOk(_) => bail!("unexpected PollOk message"),
             CommitOffsets(payload) => payload.handle(msg, node, tx).await,
-            CommitOffsetsOk(payload) => payload.handle(msg, node, tx).await,
+            CommitOffsetsOk(_) => bail!("unexpected CommitOffsetsOk message"),
             ListCommittedOffsets(payload) => payload.handle(msg, node, tx).await,
-            ListCommittedOffsetsOk(payload) => payload.handle(msg, node, tx).await,
+            ListCommittedOffsetsOk(_) => {
+                bail!("unexpected ListCommittedOffsetsOk message")
+            }
             Error(payload) => payload.handle(msg, node, tx).await,
         }
     }

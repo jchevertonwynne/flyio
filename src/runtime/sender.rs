@@ -39,9 +39,14 @@ where
     }
 }
 
-#[derive(Default)]
 pub struct CollectSender<P> {
     inner: Arc<Mutex<Vec<Message<Body<P>>>>>,
+}
+
+impl<P> Default for CollectSender<P> {
+    fn default() -> Self {
+        Self { inner: Arc::new(Mutex::new(Vec::new())) }
+    }
 }
 
 impl <P> Clone for CollectSender<P> {

@@ -273,11 +273,11 @@ mod handlers {
         {
             match self {
                 BroadcastNodePayload::Broadcast(payload) => payload.handle(msg, node, tx).await,
-                BroadcastNodePayload::BroadcastOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::BroadcastOk(_) => bail!("unexpected BroadcastOk message"),
                 BroadcastNodePayload::Read(payload) => payload.handle(msg, node, tx).await,
-                BroadcastNodePayload::ReadOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::ReadOk(_) => bail!("unexpected ReadOk message"),
                 BroadcastNodePayload::Topology(payload) => payload.handle(msg, node, tx).await,
-                BroadcastNodePayload::TopologyOk(payload) => payload.handle(msg, node, tx).await,
+                BroadcastNodePayload::TopologyOk(_) => bail!("unexpected TopologyOk message"),
                 BroadcastNodePayload::SendMin(payload) => payload.handle(msg, node, tx).await,
             }
         }
@@ -340,21 +340,6 @@ mod handlers {
     #[serde(rename_all = "snake_case")]
     pub(super) struct BroadcastOk;
 
-    impl BroadcastOk {
-        #[allow(clippy::unused_async)]
-        async fn handle<T>(
-            self,
-            _msg: Message<Body<()>>,
-            _node: &BroadcastNode,
-            _tx: T,
-        ) -> anyhow::Result<()>
-        where
-            T: MessageSender<BroadcastNodePayload>,
-        {
-            bail!("unexpected BroadcastOk message")
-        }
-    }
-
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub(super) struct Read;
@@ -407,21 +392,6 @@ mod handlers {
     #[serde(rename_all = "snake_case")]
     pub(super) struct ReadOk {
         messages: HashSet<u64>,
-    }
-
-    impl ReadOk {
-        #[allow(clippy::unused_async)]
-        async fn handle<T>(
-            self,
-            _msg: Message<Body<()>>,
-            _node: &BroadcastNode,
-            _tx: T,
-        ) -> anyhow::Result<()>
-        where
-            T: MessageSender<BroadcastNodePayload>,
-        {
-            bail!("unexpected ReadOk message")
-        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,20 +451,6 @@ mod handlers {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub(super) struct TopologyOk;
-    impl TopologyOk {
-        #[allow(clippy::unused_async)]
-        async fn handle<T>(
-            self,
-            _msg: Message<Body<()>>,
-            _node: &BroadcastNode,
-            _tx: T,
-        ) -> anyhow::Result<()>
-        where
-            T: MessageSender<BroadcastNodePayload>,
-        {
-            bail!("unexpected TopologyOk message")
-        }
-    }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -545,7 +501,10 @@ impl Worker<BroadcastNodePayload> for BroadcastNode {
         Some(Duration::from_millis(100))
     }
 
-    async fn handle_tick<T: MessageSender<BroadcastNodePayload>>(&self, tx: T) -> anyhow::Result<()> {
+    async fn handle_tick<T: MessageSender<BroadcastNodePayload>>(
+        &self,
+        tx: T,
+    ) -> anyhow::Result<()> {
         let plan = self.flush_pending().await;
 
         let sends = stream::iter(plan)
@@ -604,11 +563,7 @@ impl Node<(), Self> for BroadcastNode {
         })
     }
 
-    async fn handle<T>(
-        &self,
-        msg: Message<Body<Self::Payload>>,
-        tx: T,
-    ) -> anyhow::Result<()>
+    async fn handle<T>(&self, msg: Message<Body<Self::Payload>>, tx: T) -> anyhow::Result<()>
     where
         T: MessageSender<Self::Payload>,
     {
